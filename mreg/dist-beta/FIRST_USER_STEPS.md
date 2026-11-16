@@ -1,25 +1,21 @@
 # First steps for a private-beta user (client 0.5.2)
 
-Written 2026-11-12 after the pre-launch reset; updated 2026-11-14 for client 0.5.2. Commands are the client's own (`python mreg.py --help` and `<command> --help`).
+Written 2026-11-12 after the pre-launch reset; updated 2026-11-14 for client 0.5.2. Commands are the client's own (`mreg --help` and `<command> --help`).
 What you should see below is what the registry's records say it should be; wording the client prints that we did not check is
 marked "(wording not checked)". Never paste a key into a chat, a ticket, a file or a command line. If a step differs, see the
 last section.
 
-This is client 0.5.2 (see CHANGES-0.5.2.md, CHANGES-0.5.1.md, and CHANGES-0.5.0.md; read them if you used 0.4.x). Building on 0.5.0's strict
+This is client 0.5.2 (see CHANGES-0.5.2.md). Building on 0.5.0's strict
 admission (`install` and `ci` refuse exit 4 without `--allow-unverified`) and `mreg check` (which runs your project's own code and is
 not a sandbox) and 0.5.1's `--require-views` / `MREG_REQUIRE_VIEWS=1` (contract 1.2.0), Tarjan SCC cycle fix in `mreg check`,
 `/.well-known/mreg-auth.json` endpoint discovery, and loopback callback port fallback (`8976`, `8977`, `8978`), 0.5.2 adds signed
 redacted transparency-log tombstone verification and automatic `LICENSE`/`NOTICE`/`THIRD_PARTY_LICENSES.txt` preservation. Earlier changes:
 0.4.2 made `install --check` and `ci` re-hash every installed file; 0.4.1 fixed a second sign-in on Linux.
 
-## 0. The client file
+## 0. Install the client
 
-The client is one file, `mreg.py`, in this folder. Its SHA-256 must be
-
-    1f5d0010c042180308852d6aabfd46f833faf7594737c29f8ab827aae9f079e6
-
-Check it: `certutil -hashfile mreg.py SHA256` (Windows) or `sha256sum mreg.py` (Linux, macOS). If it differs, stop and tell us.
-You need Python 3.10 or later and `git`; Lake and Lean 4.35.0 are needed only to use what you install, not for the steps below.
+Run `python -m pip install "git+https://github.com/MoteMath/MathRegistry.git"`, then `mreg --help`.
+Python 3.10 or newer and Git are required. Lean and Lake are required to use compiled packages.
 
 ## 1. Sign in at the account page
 
@@ -38,15 +34,15 @@ shown again." and the key, which starts `mreg_`. It gives read access only. Keep
 The client reads the key from the environment variable `MREG_TOKEN`, or from the file `.mreg/token` in your home folder (one
 line). Either put the key there yourself, or let the client do steps 1 to 3 for you:
 
-    python mreg.py login
+    mreg login
 
 It opens the sign-in page, creates a key and stores it in your `.mreg` folder (options: `--provider github|google`, `--label`,
-`--no-browser`). Its printed wording was not checked. `python mreg.py whoami` then tells you what kind of key is stored, and
+`--no-browser`). Its printed wording was not checked. `mreg whoami` then tells you what kind of key is stored, and
 prints nothing secret.
 
 ## 4. `mreg doctor`
 
-    python mreg.py doctor
+    mreg doctor
 
 It prints your Python version, tools found on the PATH, whether zstd is usable, the credential (kind and where it came from,
 never the key), your local store, and one request to the registry. The last line is "result: ok" when nothing is wrong, or
@@ -55,7 +51,7 @@ the next steps.
 
 ## 5. Strict audit of Mathlib
 
-    python mreg.py audit leanprover-community/mathlib4
+    mreg audit leanprover-community/mathlib4
 
 Audit is strict by default. The first time the client sees the registry's signing key it pins it and prints a line starting
 "note: pinned signing key", with the key id. That id must be
@@ -73,7 +69,7 @@ macro-scoped names are not checked by the second kernel.
 
 ## 6. Audit of an unsigned package: a failure is expected
 
-    python mreg.py audit AxiomMath/ClusterAlgebras
+    mreg audit AxiomMath/ClusterAlgebras
 
 This one should FAIL. It prints a row ending in `FAIL`, then indented lines that include `- UNSIGNED: manifest.json.sig is missing`
 and `- strict: unsigned: no registry gate record`, then a summary line starting `audit (strict): 0 of 1 builds pass`. Read the exit
@@ -90,7 +86,7 @@ and `mreg audit` still fails it. Do this only if you know why you want an unchec
 
 ## 6b. Audit of an imported package: it passes, with a different label
 
-    python mreg.py audit AxiomMath/RiemannJensen
+    mreg audit AxiomMath/RiemannJensen
 
 This one should pass, exit code 0, with one row
 
@@ -103,10 +99,10 @@ registry gated them and recompiled them and found them identical. It is not the 
 
 ## 6c. `mreg check`: is your project valid?
 
-In a project where you installed something (for example after `python mreg.py init` and `python mreg.py add leanprover-community/mathlib4`
-and `python mreg.py install Mathlib.Data.Nat.Prime.Basic`, plus a module of your own), run
+In a project where you installed something (for example after `mreg init` and `mreg add leanprover-community/mathlib4`
+and `mreg install Mathlib.Data.Nat.Prime.Basic`, plus a module of your own), run
 
-    python mreg.py check
+    mreg check
 
 It re-hashes the installed files against the registry and audits their builds (step 1), checks that everything is on one train
 (step 2), builds your own modules with Lake and fails on any `sorry`, `admit`, `native_decide`, `bv_decide` or `axiom` in them, with
@@ -120,18 +116,18 @@ would build anyway.** `--fast` skips the replay; `--json` prints one document.
 ## 7. Rotate the key
 
 On the account page, click "Rotate" in the key's row and confirm. The old key stops working and a new one is shown once: copy it,
-replace the key in `MREG_TOKEN` or `.mreg/token`, and run `python mreg.py whoami` and `python mreg.py doctor` again.
+replace the key in `MREG_TOKEN` or `.mreg/token`, and run `mreg whoami` and `mreg doctor` again.
 
 ## 8. Revoke the key
 
-Click "Revoke" in the key's row and confirm (it cannot be undone), or run `python mreg.py logout --revoke` (it signs you in again
+Click "Revoke" in the key's row and confirm (it cannot be undone), or run `mreg logout --revoke` (it signs you in again
 and revokes the stored key at the service, then deletes the stored key file). A revoked key was refused at the edge within about 30
 seconds in the three measurements we made (23, 29 and 29 seconds); the account page says about a minute, so allow a minute.
 
-What you will see. After `logout --revoke` the key file is gone, so `python mreg.py doctor` reports that there is no credential; that is
+What you will see. After `logout --revoke` the key file is gone, so `mreg doctor` reports that there is no credential; that is
 not a rejected key. To see that the revoked key no longer works, look at the key list on the account page (the key's row is struck
 through and its state reads "revoked"), or, if you kept a copy of the old key, put it in `MREG_TOKEN` and run any read such as
-`python mreg.py train`: it must fail with an error saying the key is not accepted (wording not checked). Then create a new key (step 2)
+`mreg train`: it must fail with an error saying the key is not accepted (wording not checked). Then create a new key (step 2)
 if you want to continue.
 
 ## If any step differs

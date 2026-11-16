@@ -1,6 +1,6 @@
 # mreg 0.5.2, private beta: one page
 
-You have a personal key for the private registry. `mreg.py` is one Python file with no packages to install. Check it first: its SHA-256 must equal the line for `mreg.py` in `SHA256SUMS.txt` that you were given with it (`sha256sum -c SHA256SUMS.txt`, or `certutil -hashfile mreg.py SHA256` on Windows).
+Install the client using the command in the repository README. The examples below use the installed `mreg` command. Registry access requires an approved beta account.
 
 ## What you need
 
@@ -17,27 +17,27 @@ A key looks like `mreg_...`. Put it in the environment variable `MREG_TOKEN`, or
 
 ## First commands
 
-    python mreg.py doctor      # your tools, zstd, key (judged by shape only), local store, for an https registry one request to it (an s3 registry is reported as not checked); prints no key
-    python mreg.py train       # the packages of the newest train (Lean version and Mathlib commit)
-    python mreg.py view leanprover-community/batteries
-    python mreg.py whoami      # what kind of key is stored (decoded locally; prints nothing secret)
+    mreg doctor      # your tools, zstd, key (judged by shape only), local store, for an https registry one request to it (an s3 registry is reported as not checked); prints no key
+    mreg train       # the packages of the newest train (Lean version and Mathlib commit)
+    mreg view leanprover-community/batteries
+    mreg whoami      # what kind of key is stored (decoded locally; prints nothing secret)
 
-For a first walk through sign-in, key creation, audit, rotation and revocation, follow `FIRST_USER_STEPS.md` (same folder). `python mreg.py logout --revoke` signs you in again, revokes the stored key at the service and deletes the key file.
+For a first walk through sign-in, key creation, audit, rotation and revocation, follow `FIRST_USER_STEPS.md` (same folder). `mreg logout --revoke` signs you in again, revokes the stored key at the service and deletes the key file.
 
 ## Installing
 
 By module (compiled files for the modules your project imports, and what they need):
 
-    python mreg.py init myproj          # a Lake project pinned to the train's Lean version
+    mreg init myproj          # a Lake project pinned to the train's Lean version
     cd myproj
-    python mreg.py add leanprover-community/mathlib4
-    python mreg.py install Mathlib.Data.Nat.Basic
+    mreg add leanprover-community/mathlib4
+    mreg install Mathlib.Data.Nat.Basic
 
 By named declaration (only the chunks that declaration needs):
 
-    python mreg.py add leanprover-community/mathlib4#Nat.add_comm
-    python mreg.py resolve leanprover-community/mathlib4#Nat.add_comm     # what it would fetch; nothing downloaded
-    python mreg.py env                                                      # the LEAN_PATH setting for the installed chunks
+    mreg add leanprover-community/mathlib4#Nat.add_comm
+    mreg resolve leanprover-community/mathlib4#Nat.add_comm     # what it would fetch; nothing downloaded
+    mreg env                                                      # the LEAN_PATH setting for the installed chunks
 
 `--dry-run` reports before it fetches. The client says the size first and stops above 2,000 requests unless you pass `--allow-over-budget`. `mreg ci` installs exactly what the lock file says and fails on any mismatch.
 
@@ -68,4 +68,4 @@ What a passing audit checks: that the registry's signature, its reports and its 
 
 ## Where errors go
 
-Errors and warnings go to stderr, results to stdout; each failure is one plain line and exits non-zero (1 for most; 2 for a command-line usage error; named codes for declaration import: 10 unknown declaration, 11 ambiguous name, 12 not on the train, 13 key refused or missing, 14 hash mismatch, 15 forbidden mix of files, 16 registry unreachable, 17 object missing or taken down, 18 build removed, 19 index unusable, 20 wrong Lean toolchain, 21 over the request budget, 130 interrupted). When the registry says why it refused a key (bad signature, revoked, blocked), the client prints that reason. `MREG_DEBUG=1` adds a traceback with keys removed. Send what the command printed, plus `python mreg.py doctor`, to the person who gave you the key. Do not paste your key.
+Errors and warnings go to stderr, results to stdout; each failure is one plain line and exits non-zero (1 for most; 2 for a command-line usage error; named codes for declaration import: 10 unknown declaration, 11 ambiguous name, 12 not on the train, 13 key refused or missing, 14 hash mismatch, 15 forbidden mix of files, 16 registry unreachable, 17 object missing or taken down, 18 build removed, 19 index unusable, 20 wrong Lean toolchain, 21 over the request budget, 130 interrupted). When the registry says why it refused a key (bad signature, revoked, blocked), the client prints that reason. `MREG_DEBUG=1` adds a traceback with keys removed. Send what the command printed, plus `mreg doctor`, to the person who gave you the key. Do not paste your key.
