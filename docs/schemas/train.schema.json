@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathregistry.com/x/docs/schemas/train.schema.json",
+  "title": "mreg-train/0",
+  "description": "/v1/index/trains/<train>.json (PROTOCOL_v0.md sections 5 and 11.4).",
+  "type": "object",
+  "required": [
+    "schema",
+    "train",
+    "state",
+    "toolchain",
+    "platforms",
+    "mathlib",
+    "pins",
+    "packages",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mreg-train/0"
+    },
+    "train": {
+      "type": "string",
+      "pattern": "^lean-"
+    },
+    "state": {
+      "enum": [
+        "open",
+        "frozen"
+      ]
+    },
+    "toolchain": {
+      "type": "string"
+    },
+    "platforms": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "mathlib": {
+      "type": "object",
+      "required": [
+        "rev"
+      ],
+      "properties": {
+        "rev": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "input_rev": {
+          "type": "string"
+        },
+        "via": {
+          "enum": [
+            "mathlib-cache",
+            "registry"
+          ]
+        },
+        "declared_toolchain": {
+          "type": "string"
+        }
+      }
+    },
+    "pins": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{40}$"
+      }
+    },
+    "packages": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "version",
+          "build_key"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "build_key": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{16}$"
+          },
+          "lake_name": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "modules": {
+            "type": "integer"
+          },
+          "module_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "git": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "module_roots": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "not_in_train": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "version",
+          "reason"
+        ]
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "frozen_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "log_seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "baseline": {
+      "type": "boolean"
+    },
+    "prerelease": {
+      "type": "boolean"
+    },
+    "lean_version": {
+      "type": "string"
+    },
+    "note": {
+      "type": "string"
+    },
+    "tools": {
+      "type": "object",
+      "properties": {
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

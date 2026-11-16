@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathregistry.com/x/docs/schemas/manifest.schema.json",
+  "title": "lean-build-manifest/2",
+  "description": "manifest.json of one build (PROTOCOL_v0.md sections 6 and 11, PHASE2_CONTRACTS.md section 4). Unknown fields are allowed.",
+  "type": "object",
+  "required": [
+    "schema",
+    "id",
+    "version",
+    "package",
+    "commit",
+    "license",
+    "toolchain",
+    "platform",
+    "build_key",
+    "resolve_key",
+    "closure",
+    "kind",
+    "modules_built",
+    "files",
+    "shards",
+    "aux_files",
+    "gates",
+    "reports",
+    "packed_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "lean-build-manifest/2"
+    },
+    "id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "subdir": {
+      "type": "string"
+    },
+    "package": {
+      "type": "string"
+    },
+    "source_repo": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "committed_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "license": {
+      "type": "string"
+    },
+    "license_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "license_from": {
+      "enum": [
+        "package",
+        "repository"
+      ]
+    },
+    "toolchain": {
+      "type": "string"
+    },
+    "platform": {
+      "type": "string"
+    },
+    "build_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "resolve_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "closure": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "source_changes": {
+      "type": [
+        "array",
+        "object",
+        "null"
+      ]
+    },
+    "kind": {
+      "enum": [
+        "pinned",
+        "train"
+      ]
+    },
+    "trains": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "native_artifacts": {
+      "type": "boolean"
+    },
+    "usable_on": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "platform",
+          "basis"
+        ],
+        "properties": {
+          "platform": {
+            "type": "string"
+          },
+          "basis": {
+            "enum": [
+              "g3",
+              "portable-rule"
+            ]
+          }
+        }
+      }
+    },
+    "source_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lake_manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "modules_expected": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "modules_built": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "modules_without_source": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "module_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "bytes_uncompressed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "bytes_compressed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "shards": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "sha256",
+          "bytes"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^shards/part-[0-9]{5}\\.tar\\.zst$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bytes_uncompressed": {
+            "type": "integer"
+          },
+          "files": {
+            "type": "integer"
+          },
+          "first_module": {
+            "type": "string"
+          },
+          "last_module": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "aux_files": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "bytes"
+        ],
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "required": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5",
+        "G6",
+        "G7",
+        "G8",
+        "G9",
+        "G10"
+      ],
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "pass",
+              "flag",
+              "fail",
+              "not run"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reports": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^reports/"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    },
+    "builder": {
+      "type": "object"
+    },
+    "packed_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "unofficial": {
+      "type": "boolean"
+    }
+  }
+}

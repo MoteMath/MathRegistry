@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mreg"
+version = "0.5.2"
+description = "Command-line client for the MathRegistry Lean package registry"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["zstandard>=0.22; python_version < '3.14'"]
+
+[project.scripts]
+mreg = "mreg:main"
+
+[project.urls]
+Homepage = "https://mathregistry.com"
+Repository = "https://github.com/MoteMath/MathRegistry"
+
+[tool.setuptools]
+py-modules = ["mreg"]
+package-dir = {"" = "mreg"}

@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathregistry.com/x/docs/schemas/log-entry.schema.json",
+  "title": "mreg-log/1 entry",
+  "description": "/v1/log/<n>.json (PHASE2_CONTRACTS.md section 5.2; the fields of the key entry are taken from promote/promote.py apply_key because the contract names the type without listing them). Stored as canonical JSON.",
+  "type": "object",
+  "required": [
+    "schema",
+    "n",
+    "time",
+    "prev",
+    "type"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mreg-log/1"
+    },
+    "n": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "time": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "prev": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "type": {
+      "enum": [
+        "promote",
+        "adopt",
+        "key",
+        "redacted"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "type": {
+          "enum": [
+            "promote",
+            "adopt"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "build_key": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sig_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "gates": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^G([1-9]|10)$"
+          },
+          "additionalProperties": {
+            "enum": [
+              "pass",
+              "flag",
+              "fail",
+              "not run"
+            ]
+          }
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "job_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "build_key",
+        "manifest_sha256",
+        "sig_sha256",
+        "gates",
+        "labels"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "key"
+        },
+        "action": {
+          "enum": [
+            "bootstrap",
+            "add"
+          ]
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "public_key_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "retired": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{16}$"
+          }
+        }
+      },
+      "required": [
+        "action",
+        "key_id",
+        "public_key_sha256",
+        "retired"
+      ]
+    },
+    {
+      "properties": {
+        "schema": {
+          "const": "mreg-log/1"
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "time": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "prev": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "type": {
+          "const": "redacted"
+        },
+        "entry_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reason": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{1,63}$"
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "signature": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "minLength": 80
+        }
+      },
+      "required": [
+        "entry_sha256",
+        "reason",
+        "key_id",
+        "signature"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

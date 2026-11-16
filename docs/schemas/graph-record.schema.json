@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathregistry.com/x/docs/schemas/graph-record.schema.json",
+  "title": "mreg-graph/1 record",
+  "description": "One line of reports/graph.jsonl.zst (PHASE2_CONTRACTS.md section 9): a header, a module record or a declaration record. Validate each line separately.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "t",
+        "schema",
+        "hash",
+        "modules_listed"
+      ],
+      "properties": {
+        "t": {
+          "const": "header"
+        },
+        "schema": {
+          "const": "mreg-graph/1"
+        },
+        "hash": {
+          "const": "mreg-expr-hash64-v1"
+        },
+        "init": {
+          "type": "string"
+        },
+        "modules_listed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "t",
+        "module",
+        "imports",
+        "init"
+      ],
+      "properties": {
+        "t": {
+          "const": "module"
+        },
+        "module": {
+          "type": "string"
+        },
+        "imports": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "init": {
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "t",
+        "name",
+        "module",
+        "kind",
+        "th",
+        "tu",
+        "helper"
+      ],
+      "properties": {
+        "t": {
+          "const": "decl"
+        },
+        "name": {
+          "type": "string"
+        },
+        "module": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "theorem",
+            "def",
+            "opaque",
+            "axiom",
+            "inductive",
+            "constructor",
+            "recursor",
+            "quot"
+          ]
+        },
+        "th": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "tu": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            ]
+          }
+        },
+        "vh": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "vu": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            ]
+          }
+        },
+        "helper": {
+          "type": "boolean"
+        },
+        "helper_why": {
+          "enum": [
+            "internal",
+            "proof",
+            "match",
+            "eqn",
+            "aux",
+            "private"
+          ]
+        },
+        "unsafe": {
+          "const": true
+        }
+      }
+    }
+  ]
+}

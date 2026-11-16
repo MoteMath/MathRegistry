@@ -1,0 +1,344 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathregistry.com/x/docs/schemas/package.schema.json",
+  "title": "mreg-package/0",
+  "description": "/v1/index/<id>.json (PROTOCOL_v0.md section 4, with the signed, labels and log_n fields of PHASE2_CONTRACTS.md section 8).",
+  "type": "object",
+  "required": [
+    "schema",
+    "id",
+    "lake_name",
+    "source",
+    "license",
+    "hosted",
+    "ownership",
+    "dist_tags",
+    "versions",
+    "updated_at",
+    "log_seq"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mreg-package/0"
+    },
+    "id": {
+      "type": "string"
+    },
+    "lake_name": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "host",
+        "repo",
+        "subdir"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subdir": {
+          "type": "string"
+        }
+      }
+    },
+    "license": {
+      "type": "object",
+      "required": [
+        "spdx",
+        "from"
+      ],
+      "properties": {
+        "spdx": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "enum": [
+            "package",
+            "repository"
+          ]
+        }
+      }
+    },
+    "hosted": {
+      "type": "boolean"
+    },
+    "ownership": {
+      "enum": [
+        "imported",
+        "claimed"
+      ]
+    },
+    "dist_tags": {
+      "type": "object",
+      "required": [
+        "latest",
+        "head"
+      ],
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "versions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "commit",
+          "committed_at",
+          "version_from",
+          "yanked",
+          "deprecated",
+          "builds"
+        ],
+        "properties": {
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "committed_at": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          },
+          "version_from": {
+            "enum": [
+              "tag",
+              "untagged"
+            ]
+          },
+          "declared_toolchain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "path",
+                  "sha256",
+                  "bytes"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  }
+                }
+              }
+            ]
+          },
+          "yanked": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "at",
+                  "reason"
+                ]
+              }
+            ]
+          },
+          "deprecated": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "at",
+                  "reason"
+                ]
+              }
+            ]
+          },
+          "builds": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "build_key",
+                "resolve_key",
+                "kind",
+                "trains",
+                "toolchain",
+                "built_on",
+                "usable_on",
+                "manifest",
+                "modules",
+                "gates"
+              ],
+              "properties": {
+                "build_key": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{16}$"
+                },
+                "resolve_key": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{16}$"
+                },
+                "kind": {
+                  "enum": [
+                    "pinned",
+                    "train"
+                  ]
+                },
+                "trains": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "toolchain": {
+                  "type": "string"
+                },
+                "built_on": {
+                  "type": "string"
+                },
+                "usable_on": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "platform",
+                      "basis"
+                    ],
+                    "properties": {
+                      "platform": {
+                        "type": "string"
+                      },
+                      "basis": {
+                        "enum": [
+                          "g3",
+                          "portable-rule"
+                        ]
+                      }
+                    }
+                  }
+                },
+                "source_changes": {
+                  "type": [
+                    "array",
+                    "object",
+                    "null"
+                  ]
+                },
+                "manifest": {
+                  "type": "object",
+                  "required": [
+                    "path",
+                    "sha256"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "pattern": "^/v1/blobs/"
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  }
+                },
+                "modules": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "module_roots": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "files": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "bytes_compressed": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "shards": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "gates": {
+                  "type": "object",
+                  "propertyNames": {
+                    "pattern": "^G([1-9]|10)$"
+                  },
+                  "additionalProperties": {
+                    "enum": [
+                      "pass",
+                      "flag",
+                      "fail",
+                      "not run"
+                    ]
+                  }
+                },
+                "packed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "signed": {
+                  "type": "boolean"
+                },
+                "labels": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "log_n": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "updated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "log_seq": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

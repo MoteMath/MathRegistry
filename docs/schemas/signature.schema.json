@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathregistry.com/x/docs/schemas/signature.schema.json",
+  "title": "mreg-sig/1",
+  "description": "manifest.json.sig (PHASE2_CONTRACTS.md section 5.1). Signed message: mreg-sig-v1, id, version, build_key, manifest_sha256, sorted labels joined by comma, promoted_at, each followed by a newline.",
+  "type": "object",
+  "required": [
+    "schema",
+    "alg",
+    "key_id",
+    "id",
+    "version",
+    "build_key",
+    "manifest_sha256",
+    "labels",
+    "promoted_at",
+    "signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "mreg-sig/1"
+    },
+    "alg": {
+      "const": "ECDSA_P256_SHA256"
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "build_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "clean",
+          "partial",
+          "flagged",
+          "adopted"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "promoted_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$"
+    }
+  }
+}
