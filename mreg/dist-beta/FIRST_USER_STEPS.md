@@ -1,11 +1,11 @@
-# First steps for a private-beta user (client 0.6.0)
+# First steps with mreg 0.6.6
 
-Written 2026-11-12 after the pre-launch reset; updated 2026-11-14 for client 0.5.2. Commands are the client's own (`mreg --help` and `<command> --help`).
+Updated 2026-11-17 for mreg 0.6.6. Commands are the client's own (`mreg --help` and `<command> --help`).
 What you should see below is what the registry's records say it should be; wording the client prints that we did not check is
 marked "(wording not checked)". Never paste a key into a chat, a ticket, a file or a command line. If a step differs, see the
 last section.
 
-Client 0.6.0 supports signed declaration receipts and original-module installs with --preserve-behavior. The previous release was 0.5.2 (see CHANGES-0.5.2.md). Building on 0.5.0's strict
+Mreg 0.6.6 preserves user-edited Lean files and reuses the generated entry and chunk directory recorded in the lock. Signed declaration installs use the registry receipt. Use --preserve-behavior to install the original modules. Building on 0.5.0's strict
 admission (`install` and `ci` refuse exit 4 without `--allow-unverified`) and `mreg check` (which runs your project's own code and is
 not a sandbox) and 0.5.1's `--require-views` / `MREG_REQUIRE_VIEWS=1` (contract 1.2.0), Tarjan SCC cycle fix in `mreg check`,
 `/.well-known/mreg-auth.json` endpoint discovery, and loopback callback port fallback (`8976`, `8977`, `8978`), 0.5.2 adds signed

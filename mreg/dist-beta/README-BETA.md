@@ -1,4 +1,4 @@
-# mreg 0.6.0, private beta: one page
+# mreg 0.6.6 client guide
 
 Install the client using the command in the repository README. The examples below use the installed `mreg` command. Registry access requires an approved beta account.
 
