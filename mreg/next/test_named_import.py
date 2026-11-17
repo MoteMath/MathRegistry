@@ -616,9 +616,8 @@ class Builds(Base):
         c, js, o, e = self.run_cli("add", self.ENTRY, "--chunks")
         self.assertEqual((c, js["error"]["kind"]), (12, "not_on_train"))
         self.assertIn("current.json", js["error"]["message"])
-        self.assertFalse(M.ni_probe(mock.Mock(dir=self.proj, train=TRAIN)) if False else False)
         with mock.patch.dict(os.environ, self.env):
-            self.assertFalse(M.ni_probe(mock.Mock(dir=self.proj, train=TRAIN)))
+            self.assertFalse(M.ni_probe(mock.Mock(spec=["dir", "train"], dir=self.proj, train=TRAIN)))
 
     def test_pointer_manifest_hash_mismatch_caches_nothing(self):
         m = self.mirror(publish=False)
@@ -1211,6 +1210,9 @@ class RealTables(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.adj.clear()
+        cls.rows.clear()
+        cls.tcchunk.clear()
         shutil.rmtree(cls.tmp, True)
 
     def closure(self, start):

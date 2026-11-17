@@ -728,7 +728,7 @@ class AdmissionChunks(Adm):
 
 class VersionAndHelp(unittest.TestCase):
     def test_version_and_flags(self):
-        self.assertEqual(M.VERSION, "0.5.2")
+        self.assertEqual(M.VERSION, "0.6.6")
         for cmd in ("install", "ci", "add"):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):

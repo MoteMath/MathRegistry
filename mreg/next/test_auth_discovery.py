@@ -61,6 +61,7 @@ class AuthDiscoveryTests(unittest.TestCase):
         }
         srv = _DiscoveryServer(lambda p: (200, doc) if p == M.WELL_KNOWN_AUTH_PATH else (404, {}))
         self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         with self._clean_env(MREG_REGISTRY=srv.url):
             cfg = M.discover_auth_config()
         self.assertTrue(cfg["discovered"])
@@ -80,6 +81,7 @@ class AuthDiscoveryTests(unittest.TestCase):
         for reply in ((404, b"not found"), (200, b"not-json")):
             srv = _DiscoveryServer(lambda _p, r=reply: r)
             self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
             with self._clean_env(MREG_REGISTRY=srv.url):
                 cfg = M.discover_auth_config()
             self.assertFalse(cfg["discovered"])
@@ -91,6 +93,7 @@ class AuthDiscoveryTests(unittest.TestCase):
     def test_rejects_non_https_discovered_urls(self):
         srv = _DiscoveryServer(lambda _p: (200, {"schema": "mreg-auth/1", "auth_url": "http://insecure.example"}))
         self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         with self._clean_env(MREG_REGISTRY=srv.url):
             with self.assertRaises(SystemExit) as cm:
                 M.discover_auth_config()
@@ -136,6 +139,7 @@ class AuthDiscoveryTests(unittest.TestCase):
             if p == M.WELL_KNOWN_AUTH_PATH else (404, {})
         )
         self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         with self._clean_env(MREG_REGISTRY=srv.url):
             cfg = M.discover_auth_config()
         self.assertFalse(cfg["discovered"])

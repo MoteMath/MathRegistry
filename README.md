@@ -4,7 +4,7 @@ MathRegistry distributes compiled Lean packages and exposes their verification r
 
 ## Install mreg
 
-Python 3.10 or newer and Git are required.
+Use the [website installer](https://mathregistry.com/docs/install/) for the current published release. To install this checkout through pip, use Python 3.10 or newer and Git.
 
 ```sh
 python -m pip install "git+https://github.com/MoteMath/MathRegistry.git"
@@ -15,7 +15,7 @@ Python 3.14 supplies zstd support through its standard library. Earlier Python v
 
 ## Sign in and install a package
 
-Registry access currently requires an approved beta account. Sign in through the browser, then create a Lean project and install a module.
+Package downloads require a beta account. You can sign up through the website. Sign in through the browser, then create a Lean project and install a module.
 
 ```sh
 mreg login
@@ -30,7 +30,7 @@ Install Lean and Lake through elan before using the compiled packages. Supported
 
 ## Contents
 
-- `mreg/mreg.py` is the version 0.5.2 client.
+- `mreg/mreg.py` is the version 0.6.6 client.
 - `mreg/installer/` contains the shell, PowerShell and Python installer templates. The Python template requires release-version and SHA-256 substitution before distribution.
 - `mreg/next/` contains the matching client copy and its regression tests.
 - `mcp/` contains the local HTTP MCP server and index builder.

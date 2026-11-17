@@ -1,4 +1,4 @@
-# mreg 0.5.2, private beta: one page
+# mreg 0.6.0, private beta: one page
 
 Install the client using the command in the repository README. The examples below use the installed `mreg` command. Registry access requires an approved beta account.
 
@@ -33,23 +33,23 @@ By module (compiled files for the modules your project imports, and what they ne
     mreg add leanprover-community/mathlib4
     mreg install Mathlib.Data.Nat.Basic
 
-By named declaration (only the chunks that declaration needs):
+In a fresh project on a train that advertises a verified checking store, request a declaration by its owning package and Lean name.
 
-    mreg add leanprover-community/mathlib4#Nat.add_comm
-    mreg resolve leanprover-community/mathlib4#Nat.add_comm     # what it would fetch; nothing downloaded
+    mreg add --chunks 'leanprover-community/mathlib4#List.perm_insertionSort'
+    mreg verify
     mreg env                                                      # the LEAN_PATH setting for the installed chunks
 
 `--dry-run` reports before it fetches. The client says the size first and stops above 2,000 requests unless you pass `--allow-over-budget`. `mreg ci` installs exactly what the lock file says and fails on any mismatch.
 
 ## What `mreg audit` tells you, and what it does not
 
-Mathlib and its seven dependency packages are served as the registry's own gated, signed builds (label `clean`), promoted on 12 November 2026. The three AxiomMath packages are served unsigned and not gated. A strict audit says which is which on the day you run it; today the eight clean packages pass and the three AxiomMath packages fail as unsigned.
+Run `mreg audit <package>` to inspect the signed build currently served for a package. For a project installed by declaration, `mreg audit --strict` also checks the slice receipt and source build identities.
 
 `mreg audit <package>` (or with no name, the packages in your `mreg.lock`) is **strict by default** (the registry's rule since 2026-11-12: it fails on an unsigned build or a gate that did not run). For each build it prints one line and, if the build fails, one `- ` line per reason (an unsigned build also prints `UNSIGNED: manifest.json.sig is missing`). Exit code 0 only if every build passes; 1 otherwise.
 
 What each report means:
 
-- `unsigned: no registry gate record`. The build has no registry signature and no promotion record: it has no registry gate record. An unsigned build may still show statuses for G3 and G5 (for example `[G3:pass G5:pass]` in `mreg view`); the earlier loader wrote those into the package document. They are not backed by a signed gate record, and strict `audit` reports the build as unsigned. The client still compared the files you downloaded with the SHA-256 the registry recorded for them, but those recorded hashes are unsigned. Exit 1. Today you should expect this on the three AxiomMath packages (ClusterAlgebras, RiemannJensen, Stacks); the eight others audit OK: `mreg view` shows `labels=-` and `unsigned: no registry gate record`, and a strict `mreg audit` prints `FAIL`, `UNSIGNED: manifest.json.sig is missing` and a `strict: unsigned: no registry gate record` line, then exits 1. That is the strict audit working, not a fault of your install.
+- `unsigned: no registry gate record`. The build has no registry signature and no promotion record: it has no registry gate record. An unsigned build may still show statuses for G3 and G5 (for example `[G3:pass G5:pass]` in `mreg view`); the earlier loader wrote those into the package document. They are not backed by a signed gate record, and strict `audit` reports the build as unsigned. The client still compared the files you downloaded with the SHA-256 the registry recorded for them, but those recorded hashes are unsigned. Exit 1.
 - `labels=clean`. The build is signed, in the promotion log, and the gates G1 to G10 passed (the policy allows G9 not to run; the live eight all show it as pass) (the registry compiled it and checked it with Lean's replay and a second kernel). Exit 0.
 - `labels=imported`. Files compiled elsewhere, gated here (G2 to G10), and a sample of modules recompiled here and found identical. The registry did not compile all of them. It is not `clean`. Exit 0 if the signature, log and gates are consistent.
 - `partial`, `flagged` or no label, a gate `not run`, `flag`, `fail` or missing where the label needs `pass`, or a signature or log that does not agree with the build: reported as `strict:` lines, exit 1.
@@ -63,7 +63,7 @@ What a passing audit checks: that the registry's signature, its reports and its 
 - Large cones: many declarations need thousands of chunks (some tens of thousands). Lean maps every file: it needs 8 to 9 GiB of address space for large cones. Never cap address space (`ulimit -v`); cap resident memory instead.
 - Chunks give kernel checking and reference by name only. They carry no instances, simp sets, notation, parsers, macros or tactics: they are not a base for writing new proofs.
 - Lake does not see chunks. Only plain `lean` or `lake env lean` with `LEAN_PATH` set from `mreg env` does; `lake build` does not.
-- Chunks are tied to one Lean version, are not signed, and are trusted by hash against a list held in the same place.
+- Verified checking stores bind the dependency closure to signed package builds and a signed declaration receipt. The published b1 store remains experimental.
 - Wait times: the client retries on busy or slow answers (`Retry-After` is honoured, at most 30 seconds).
 
 ## Where errors go

@@ -128,6 +128,7 @@ class Base(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def env(self, token=None, registry=None, file_token=None, path=None, **extra):
@@ -386,7 +387,7 @@ class TestDoctor(Base):
         doc = json.loads(out)
         self.assertEqual(doc["schema"], "mreg-doctor/0")
         self.assertIs(doc["schema_frozen"], False)
-        self.assertEqual(doc["mreg_version"], "0.5.2")
+        self.assertEqual(doc["mreg_version"], "0.6.6")
         self.assertTrue(doc["python"]["ok"])
         for n, v in (("git", "9.9.9"), ("lake", "8.8.8"), ("lean", "7.7.7")):
             self.assertIsNotNone(doc["tools"][n]["found"])
@@ -599,10 +600,10 @@ class TestClientHardening(unittest.TestCase):
         srv2.other_url = f"http://127.0.0.1:{srv1.server_port}"
         threading.Thread(target=srv1.serve_forever, daemon=True).start()
         threading.Thread(target=srv2.serve_forever, daemon=True).start()
-        self.addCleanup(srv1.shutdown)
-        self.addCleanup(srv2.shutdown)
         self.addCleanup(srv1.server_close)
         self.addCleanup(srv2.server_close)
+        self.addCleanup(srv1.shutdown)
+        self.addCleanup(srv2.shutdown)
 
         base1 = f"http://127.0.0.1:{srv1.server_port}"
         # _no_redirect_open refuses 302 outright

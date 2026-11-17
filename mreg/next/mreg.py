@@ -6,6 +6,8 @@
   mreg init <dir> [--train T] [--name N]     new Lake project pinned to a train's Lean version
   mreg add <package id>[#<Decl.name>] [...]  require a package of the train (its commit on the train); with #Decl.name
                                              also record that declaration in mreg.json (installed module-level for now)
+                                             a package in a repository subdirectory gets its Lake `subDir`; one with a path dependency pack
+                                             also gets its other git dependencies pinned from the train build's signed lake-manifest.json
   mreg install [<Module.Name> ...] [--all] [--dry-run] [--check] [--no-rehash] [--train T] [--allow-source] [--allow-unverified]
                                              admission first: every build must pass the strict audit, else REFUSED (exit 4), nothing written
   mreg ci [--no-rehash] [--allow-unverified] install exactly what mreg.lock says (admission is run again), re-hash the installed files; any mismatch fails
@@ -25,6 +27,14 @@ closure. `--all` takes every module of every package instead. An argument `owner
 resolved to the module that defines it (from the build's reports/graph.jsonl.zst) and that module's import closure is
 installed. This is the module-level path (the module comes from a build that passed admission).
 
+PATH DEPENDENCIES (0.6.4). A package in a repository subdirectory may name its own repository as a Lake path dependency (`path = "../.."`).
+Lake checks the whole repository out to .lake/packages/<name> (the package is <clone>/<subDir>) and lists the dependency in the project's
+lake-manifest.json as a path package inside that clone. The signed build manifest binds a pack of the dependency's compiled modules
+(`path_dependencies`); `install` writes that pack into the checkout Lake made and nowhere else: the directory must be the one Lake resolved,
+equal to the signed record, inside the clone, not .git or .lake, reached through no link, and the clone must be at the build's commit. The pack
+is hash-checked (signed manifest -> nested manifest -> shard and index SHA-256 -> every file's SHA-256) before anything is written.
+`verify`, `install --check` and `ci` re-hash it; mreg.lock records it under the package.
+
 ADMISSION (0.5.0). Before anything is fetched or written, `install` and `ci` run the strict audit (the one `mreg audit` runs by
 default: signed, label clean or imported, the gates that label needs pass, G7 run, signature, reports and log consistent) on every
 registry build. A build that does not pass is REFUSED: exit 4, one line per package, nothing installed. `--allow-unverified` installs
@@ -33,9 +43,11 @@ allowed_unverified true); `mreg audit` keeps showing it. Four statuses are kept 
 (the bytes were fetched), `hash_matched` (their SHA-256 equals the registry's recorded one), `compatible` (Lake's check passed; "not
 checked" when it did not run) and `proof_checked_under_policy` (true only when the strict audit passed). The strict audit compares the
 registry's records with each other; it does not re-check any proof here.
-Declaration-level installs (`owner/pkg#Decl`, the chunk store) are EXPERIMENTAL and UNVERIFIED: no axiom audit, kernel replay or
-second kernel has checked the chunks. They are refused unless `--allow-unverified` is given; `--module-level` installs the declaration's
-module from a checked build instead.
+Declaration-level installs (`owner/pkg#Decl`) require a signed receipt covering the reduced proof environment and its source builds.
+Compact declaration installs verify the current source gate reports and signed digests of supporting reports.
+Use `mreg audit --strict` to download and hash every supporting report.
+Older experimental stores require `--allow-unverified`. Use `--preserve-behavior` for source elaboration, tactics and execution
+through the original checked modules.
 
 Every byte is compared with the registry's own recorded SHA-256: package document -> manifest SHA-256 -> index file SHA-256 -> per-module frame SHA-256.
 A hash match shows the bytes equal what the registry recorded. It is not a check of any proof, and importing a compiled file does not re-check its proofs.
@@ -62,11 +74,12 @@ stderr says so; confirm the key id out of band). A DIFFERENT key later is refuse
 """
 import argparse, base64, contextlib, errno, hashlib, hmac, http.client, http.server, io, json, os, platform as _pf, re, select, socket, subprocess, sys, tarfile
 import threading, time, webbrowser
+import types as _types
 import secrets as _secrets, socket as _sock, shutil
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.5.2"
+VERSION = "0.6.6"
 # THE ONE-LINE SWITCH (owner decided 2026-11-12, "Hand out, strict audit (Recommended)": strict is the default): True = `mreg audit` is strict unless `--lenient` is given;
 # False = `mreg audit` is lenient (the 0.3 behaviour) unless `--strict` is given. Nothing else in the file reads a default.
 AUDIT_STRICT_DEFAULT = True
@@ -897,15 +910,35 @@ def toolchain_of(d):
     return open(os.path.join(d, "lean-toolchain"), encoding="utf-8").read().strip()
 
 
+def _safe_subdir(sub, who):
+    """A git package's `subDir` from lake-manifest.json: relative, forward slashes, no `.` or `..` part."""
+    if sub in (None, "", "."):
+        return ""
+    if (not isinstance(sub, str) or sub.startswith(("/", "\\")) or "\\" in sub or re.match(r"[A-Za-z]:", sub)
+            or any(p in ("", ".", "..") for p in sub.split("/"))):
+        die(f"{who}: unsafe subDir {sub!r} in lake-manifest.json")
+    return sub
+
+
+def clone_dir(proj, root, name):
+    """The checkout Lake made of a git package: <packagesDir>/<name>. It is the repository root, also for a package with a subDir."""
+    base = os.path.join(proj, root.get("packagesDir", ".lake/packages"))
+    d, plain = os.path.join(base, name), os.path.join(base, name.strip("«»"))
+    return d if os.path.isdir(d) or not os.path.isdir(plain) else plain
+
+
 def package_dir(proj, root, name):
+    """The directory of the Lake package: the project, a path dependency's `dir`, or a git package's checkout with its `subDir`
+    (measured with Lake 2026-11-17: the clone is the whole repository, the package lives in <clone>/<subDir>)."""
     if name == root.get("name"):
         return proj
     for p in root.get("packages", []):
         if p.get("name") == name and p.get("type") == "path" and p.get("dir"):
             return os.path.normpath(os.path.join(proj, p["dir"]))
-    base = os.path.join(proj, root.get("packagesDir", ".lake/packages"))
-    d, plain = os.path.join(base, name), os.path.join(base, name.strip("«»"))
-    return d if os.path.isdir(d) or not os.path.isdir(plain) else plain
+    d = clone_dir(proj, root, name)
+    p = next((x for x in root.get("packages", []) if x.get("name") == name and x.get("type", "git") == "git"), None)
+    sub = _safe_subdir((p or {}).get("subDir"), name)
+    return os.path.join(d, *sub.split("/")) if sub else d
 
 
 def git(d, *args):
@@ -930,8 +963,8 @@ def source_changes(proj, root, cl):
         if name == root.get("name"):
             continue
         d = package_dir(proj, root, name)
-        if not os.path.exists(os.path.join(d, ".git")):
-            continue
+        if not (os.path.exists(os.path.join(d, ".git")) or os.path.exists(os.path.join(clone_dir(proj, root, name), ".git"))):
+            continue                  # (a package with a subDir is checked out inside its repository's clone)
         spec = ["--", ".", ":(exclude).lake"]
         diff = subprocess.run(["git", "-C", d, "diff", "--binary", "HEAD"] + spec, capture_output=True).stdout
         unt = sorted(u for u in subprocess.run(["git", "-C", d, "ls-files", "--others", "--exclude-standard", "-z"] + spec,
@@ -994,6 +1027,113 @@ def own_sources(proj):
 
 # ---------------------------------------------------------------- builds
 
+def _artifact_parts(name):
+    parts = name.split("/")
+    if (parts[:2] != [".lake", "build"] or len(parts) < 3
+            or any(not p or p in (".", "..") or p.endswith((" ", "."))
+                   or any(ord(c) < 32 or c in '<>:"\\|?*' for c in p)
+                   or re.fullmatch(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³])(?:\..*)?",
+                                   p, re.IGNORECASE) for p in parts)):
+        die(f"refusing unsafe archive member {name!r}")
+    return parts
+
+
+@contextlib.contextmanager
+def _frame_reader(compressed):
+    try:
+        from compression import zstd
+    except ImportError:
+        zstd = None
+    if zstd is not None:
+        with zstd.open(io.BytesIO(compressed), "rb") as stream:
+            yield stream
+        return
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(compressed), read_across_frames=True) as stream:
+            yield stream
+        return
+    # The portable CLI fallback streams stdout. Using a temporary input avoids
+    # deadlocking on a full stdin pipe while the decoder writes a large frame.
+    with _tempfile.TemporaryFile() as source:
+        source.write(compressed)
+        source.seek(0)
+        with subprocess.Popen(["zstd", "-d", "-q", "-c"], stdin=source, stdout=subprocess.PIPE) as proc:
+            try:
+                with proc.stdout as stream:
+                    yield stream
+            finally:
+                if proc.poll() is None and sys.exc_info()[0] is not None:
+                    proc.kill()
+            if proc.wait() != 0:
+                die("invalid compressed registry frame")
+
+
+def _artifact_directory(path):
+    """Return a real directory, rejecting Windows junctions and other reparse points."""
+    import stat
+    value = os.lstat(path)
+    if (not stat.S_ISDIR(value.st_mode) or
+            getattr(value, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        die(f"refusing linked or non-directory archive destination: {path}")
+
+
+def _write_archive_file(dest, parts, source, executable):
+    parent = os.path.abspath(dest)
+    os.makedirs(parent, exist_ok=True)
+    _artifact_directory(parent)
+    if os.name == "posix":
+        # Anchor every lookup to an opened directory, including temporary-file
+        # creation and replacement, so concurrent directory swaps cannot redirect writes.
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open(parent, flags)
+        try:
+            for part in parts[:-1]:
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            tmp = _tmp_name(parts[-1])
+            raw = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fd)
+            try:
+                with os.fdopen(raw, "wb") as out:
+                    shutil.copyfileobj(source, out)
+                    os.fchmod(out.fileno(), 0o755 if executable else 0o644)
+                os.replace(tmp, parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
+            finally:
+                try:
+                    os.unlink(tmp, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(fd)
+        return
+    for part in parts[:-1]:
+        parent = os.path.join(parent, part)
+        os.makedirs(parent, exist_ok=True)
+        _artifact_directory(parent)
+    out = os.path.join(parent, parts[-1])
+    tmp = _tmp_name(out)
+    with open(tmp, "xb") as temp:
+        try:
+            shutil.copyfileobj(source, temp)
+        except BaseException:
+            temp.close()
+            os.unlink(tmp)
+            raise
+    try:
+        os.chmod(tmp, 0o755 if executable else 0o644)
+        _replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
 class Build:
     """One registry build of one package of the project."""
 
@@ -1006,6 +1146,7 @@ class Build:
         if sha256(raw) != manifest_sha256:
             die(f"{pid}: manifest SHA-256 differs from the one recorded (expected {manifest_sha256[:16]}...)")
         self.manifest_sha256 = manifest_sha256
+        self.path_deps, self.declared_changes = [], {}    # path dependency packs, source changes accepted through a bound rewrite
         self.signed, self.labels = False, []
         if signed is not False:
             sigraw = reg.get(self.base + "manifest.json.sig", missing_ok=True)
@@ -1041,43 +1182,42 @@ class Build:
         return raw
 
     def extract_many(self, pairs, verified=False):
-        """pairs: [(compressed frame bytes, frame record)]. Each frame is checked against its SHA-256 (unless the whole
-        shard was already checked), then all are decompressed in one pass and unpacked one by one."""
+        """Verify frame hashes unless the shard is already verified, then unpack each frame within its declared size."""
         if not verified:
             for comp, fr in pairs:
                 if len(comp) != fr["length"] or sha256(comp) != fr["sha256"]:
                     die(f"{self.id}: frame of {fr['module']} in {fr['shard']} does not match its SHA-256; refused, "
                         "nothing from it was written")
-        raw = unzstd(b"".join(c for c, _ in pairs))
-        if len(raw) != sum(fr["raw_length"] for _, fr in pairs):
-            die(f"{self.id}: decompressed size of {len(pairs)} frames in {pairs[0][1]['shard']} is wrong")
-        n = off = 0
-        for _, fr in pairs:
-            n += self.extract(raw[off:off + fr["raw_length"]], fr); off += fr["raw_length"]
+        n = 0
+        for compressed, fr in pairs:
+            remaining = fr["raw_length"]
+            if type(remaining) is not int or remaining < 0:
+                die(f"{self.id}: invalid frame size")
+            with _tempfile.SpooledTemporaryFile(max_size=4 << 20) as raw, _frame_reader(compressed) as stream:
+                while remaining:
+                    block = stream.read(min(remaining, 1 << 20))
+                    if not block:
+                        die(f"{self.id}: incomplete compressed frame")
+                    raw.write(block)
+                    remaining -= len(block)
+                if stream.read(1):
+                    die(f"{self.id}: decompressed frame exceeds its declared size")
+                raw.seek(0)
+                n += self.extract(raw, fr)
         return n
 
     def extract(self, raw, fr):
         n = 0
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
-            for m in tf.getmembers():
-                parts = m.name.split("/")
-                if not (m.isreg() and m.name.startswith(".lake/build/") and "\\" not in m.name
-                        and all(p not in ("", ".", "..") for p in parts)):
+        seen = set()
+        with tarfile.open(fileobj=io.BytesIO(raw) if isinstance(raw, bytes) else raw, mode="r:") as tf:
+            for m in tf:
+                parts = _artifact_parts(m.name)
+                key = m.name.casefold() if os.name == "nt" else m.name
+                if not m.isreg() or m.sparse is not None or key in seen:
                     die(f"{self.id}: refusing unsafe archive member {m.name!r}")
-                out = os.path.join(self.dest, *parts)
-                os.makedirs(os.path.dirname(out), exist_ok=True)
-                tmp = _tmp_name(out)
-                try:
-                    with open(tmp, "wb") as f:
-                        f.write(tf.extractfile(m).read())
-                        f.flush()
-                    os.chmod(tmp, 0o755 if m.mode & 0o100 else 0o644)
-                    _replace(tmp, out)
-                finally:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+                seen.add(key)
+                with tf.extractfile(m) as source:
+                    _write_archive_file(self.dest, parts, source, bool(m.mode & 0o100))
                 n += 1
         if n != fr["files"]:
             die(f"{self.id}: frame of {fr['module']} held {n} files, the index says {fr['files']}")
@@ -1130,6 +1270,72 @@ class Build:
         return {"frames": len(sel), "files": files, "bytes": sum(f["length"] for f in sel)}
 
 
+def checkout_dirt(clone):
+    """Lines of `git status` of the clone (untracked and ignored files included) outside every `.lake` directory: anything here is a local change."""
+    r = subprocess.run(["git", "-C", clone, "status", "--porcelain", "--untracked-files=all", "--ignored", "-z"], capture_output=True)
+    if r.returncode:
+        return ["git status failed"]
+    out = []
+    for ent in r.stdout.decode("utf-8", "replace").split("\0"):
+        path = ent[3:].replace("\\", "/")
+        if ent and ".lake" not in path.split("/"):
+            out.append(ent)
+    return out
+
+
+def bind_rewrite(reg, proj, name, pid, ver, entry, changed):
+    """None when the rewrite the SIGNED manifest records for `entry` (the builder's toolchain bump and train-pin rewrite of the project's
+    lake-manifest.json) is the one that turns this clean checkout into the project the build was made from; else the reason, as text.
+    Guarantee: (1) the build is signed and on a train; (2) the clone is at the build's commit with no local change (tracked, untracked or ignored,
+    outside .lake); (3) the package's own lake-manifest.json is byte-identical to the signed `from_sha256` and its lean-toolchain is the signed
+    `toolchain.from`; (4) applying the signed revision changes (each `from` equal to the clone's revision, each `to` equal to the revision this
+    project's Lake resolved) with the builder's own serialisation reproduces the signed `to_sha256`, which is the SHA-256 of the build's published
+    lake-manifest.json, and the build's toolchain is `toolchain.to` and this project's. What is NOT re-derived: the `source_changes` digest itself,
+    which also covers files the builder created in the repository and did not publish; every changed name must be a path package of this checkout."""
+    base = f"/v1/blobs/{pid}/-/{ver}/{entry['build_key']}/"
+    raw = reg.get(base + "manifest.json", missing_ok=True)
+    if raw is None or sha256(raw) != entry["manifest"]["sha256"]:
+        return "its manifest is missing or differs from the package document"
+    man = json.loads(raw)
+    rw = man.get("lake_manifest_rewrite")
+    if not isinstance(rw, dict) or not all(isinstance(rw.get(k), str) and _HEX64.fullmatch(rw[k]) for k in ("from_sha256", "to_sha256")):
+        return "the signed manifest records no lake-manifest rewrite"
+    tc = rw.get("toolchain") or {}
+    clone, pdir = clone_dir(proj.dir, proj.root, name), package_dir(proj.dir, proj.root, name)
+    if man.get("commit") != proj.commit(name) or git(clone, "rev-parse", "HEAD") != man.get("commit"):
+        return "the checkout is not at the build's commit"
+    if set(man.get("source_changes") or {}) != changed or {n for n, _ in (tuple(c) for c in man.get("closure", []))} & changed != changed:
+        return "the signed source changes name other packages than the path packages of this checkout"
+    dirt = checkout_dirt(clone)
+    if dirt:
+        return "the checkout has local changes (" + "; ".join(d.strip() for d in dirt[:3]) + ")"
+    lm_path = os.path.join(pdir, "lake-manifest.json")
+    if not os.path.isfile(lm_path):
+        return "the package has no lake-manifest.json"
+    original = open(lm_path, "rb").read()
+    if sha256(original) != rw["from_sha256"]:
+        return "the package's lake-manifest.json is not the signed original"
+    if tc and ((tc.get("from"), tc.get("to")) != (man.get("declared_toolchain"), man.get("toolchain"))
+               or toolchain_of(pdir) != tc.get("from") or tc.get("to") != proj.toolchain):
+        return "the toolchain before or after the signed rewrite does not match this checkout and project"
+    m = json.loads(original)
+    revs = {p["name"]: p.get("rev", "") for p in proj.root.get("packages", [])}
+    done = set()
+    for c in (rw.get("changes") or []):
+        pk = next((x for x in m.get("packages", []) if x.get("name") == c.get("name") and x.get("type", "git") == "git"), None)
+        if pk is None or pk.get("rev") != c.get("from") or revs.get(c["name"]) != c.get("to") or c["name"] in done:
+            return f"the signed rewrite of {c.get('name')!r} is not original -> what Lake resolved"
+        pk["rev"] = c["to"]
+        done.add(c["name"])
+    if not done and sha256(original) != rw["to_sha256"]:
+        return "the signed rewrite has no changes but the manifest differs"
+    if done and sha256((json.dumps(m, indent=2, ensure_ascii=False) + "\n").encode("utf-8")) != rw["to_sha256"]:
+        return "applying the signed rewrite does not give the signed rewritten lake-manifest.json"
+    if (man.get("aux_files") or {}).get("lake-manifest.json", {}).get("sha256") != rw["to_sha256"] or man.get("lake_manifest_sha256") != rw["to_sha256"]:
+        return "the signed rewritten lake-manifest.json is not the one the manifest lists"
+    return None
+
+
 class Project:
     def __init__(self, d):
         self.dir = os.path.abspath(d)
@@ -1150,6 +1356,21 @@ class Project:
             return id_from_url(url, "" if sub == "." else sub)
         p = next(x for x in self.root["packages"] if x["name"] == name)
         return id_from_url(p.get("url"), p.get("subDir") or "")
+
+    def in_checkout_path_deps(self, name):
+        """Names of the path packages of the project whose directory lies inside the checkout Lake made of the git package `name`."""
+        if name == self.root["name"] or not any(p.get("name") == name and p.get("type", "git") == "git" for p in self.root.get("packages", [])):
+            return set()
+        clone, out = os.path.abspath(clone_dir(self.dir, self.root, name)), set()
+        for p in self.root.get("packages", []):
+            if p.get("type") == "path" and isinstance(p.get("dir"), str) and p["dir"]:
+                d = os.path.abspath(os.path.join(self.dir, p["dir"]))
+                try:
+                    if os.path.commonpath([clone, d]) == clone:
+                        out.add(p["name"])
+                except ValueError:
+                    pass
+        return out
 
     def commit(self, name):
         if name == self.root["name"]:
@@ -1178,40 +1399,299 @@ class Project:
             cl = closure(self.dir, self.root, name) if os.path.isdir(pdir) else None
             if cl is None:
                 notes[name] = "not checked out (run `lake update`)"; continue
-            rk = resolve_key(self.toolchain, cl, source_changes(self.dir, self.root, cl))
+            changes = source_changes(self.dir, self.root, cl)
+            rk = resolve_key(self.toolchain, cl, changes)
             cand = [b for b in doc["versions"][ver]["builds"] if b["resolve_key"] == rk]
+            inpath = self.in_checkout_path_deps(name)
+            bound, reasons = {}, []
+            if not cand and inpath:
+                # A package whose path dependency lies in its own checkout (teorth/IEANTN Solutions/CH2.v4). The builder's `source_changes` for that
+                # path package is the digest of what it changed in the repository before building: its toolchain bump and the rewrite of the
+                # project's lake-manifest.json to the train's pins (plus files of its own that are not published). A clean checkout has none of
+                # that, so the digest cannot match. The build is taken only when the SIGNED manifest's recorded rewrite is bound to this checkout:
+                # see bind_rewrite. Nothing else about the sources is relaxed: other packages' source changes still stop the match.
+                for b in doc["versions"][ver]["builds"]:
+                    sc = b.get("source_changes") or {}
+                    if (b.get("signed") and b.get("trains") and sc and set(sc) <= inpath
+                            and resolve_key(self.toolchain, cl, sc) == b["resolve_key"]):
+                        why = bind_rewrite(reg, self, name, pid, ver, b, set(sc))
+                        if why is None:
+                            cand.append(b); bound[b["build_key"]] = dict(sc)
+                        else:
+                            reasons.append(f"build {b['build_key']} not taken: {why}")
             ok = [b for b in cand if any_platform or any(u["platform"] == self.platform for u in b["usable_on"])]
             if not ok:
                 notes[name] = (f"{pid} {ver}: a build exists but the registry does not list it as usable on {self.platform} (use --any-platform)"
-                               if cand else f"{pid} {ver}: no build for this toolchain and these dependency commits")
+                               if cand else f"{pid} {ver}: no build for this toolchain and these dependency commits"
+                               + (" (" + "; ".join(reasons) + ")" if reasons else ""))
                 continue
             b = ok[0]
             builds[name] = Build(reg, name, pid, ver, b["build_key"], b["manifest"]["sha256"], pdir,
                                  signed=bool(b.get("signed")))
             builds[name].trains = list(b.get("trains") or [])      # for the one-train guard
+            if b["build_key"] in bound:
+                builds[name].declared_changes = bound[b["build_key"]]
+            attach_path_deps(reg, self, name, builds[name])
+        for b in builds.values():
+            for d in b.path_deps:
+                notes.pop(d.name, None)       # installed from the package's pack, not a package of its own
         return builds, notes
 
 
-def plan(proj, builds, targets, take_all, extra=(), only_named=False):
+# ---------------------------------------------------------------- path dependencies of a registry build (2026-11-17)
+# A package in a repository subdirectory can name its own repository as a Lake path dependency (`path = "../.."`; teorth/IEANTN
+# Solutions/CH2.v4 does). The builder packs the compiled modules of such a dependency beside the package (`pathdeps/<name>/`) and the SIGNED
+# manifest binds that pack: `path_dependencies[]` = name, dir, build_key, manifest_sha256 of pathdeps/<name>/manifest.json, index_sha256 of
+# pathdeps/<name>/shards/index.jsonl. Lake (measured 2026-11-17) clones the whole repository to <packagesDir>/<lake name>, puts the package at
+# <clone>/<subDir> and lists the dependency in the consumer's lake-manifest.json as a path package whose `dir` resolves into that clone.
+# The client writes the pack into that directory and nowhere else. Trust chain: signature -> top manifest -> nested manifest sha -> shard sha
+# and index sha -> every extracted file's sha against the index. The nested frames.jsonl and modules.jsonl are not pinned by the signature, so
+# they are never trusted: frames are not used at all (the whole shard is read), modules.jsonl only chooses which Mathlib modules to fetch.
+
+PATHDEP_SCHEMAS = ("lean-build-manifest/1", "lean-build-manifest/2")
+
+
+def path_dep_entries(man, who):
+    """The validated `path_dependencies` of a signed build manifest."""
+    out, seen = [], set()
+    for e in man.get("path_dependencies") or []:
+        ok = (isinstance(e, dict) and all(isinstance(e.get(k), str) for k in ("name", "dir", "build_key", "path", "manifest_sha256", "index_sha256"))
+              and _NAME_OK.fullmatch(e["name"]) and e["path"] == f"pathdeps/{e['name']}/" and e["name"] not in seen
+              and _HEX64.fullmatch(e["manifest_sha256"]) and _HEX64.fullmatch(e["index_sha256"]))
+        if not ok:
+            die(f"{who}: malformed path_dependencies entry in the signed manifest; refused, nothing written")
+        seen.add(e["name"])
+        out.append(e)
+    return out
+
+
+def path_dep_target(proj, parent, e):
+    """Where the dependency's compiled files go: the directory Lake resolved for the path dependency, shown to lie inside the pinned
+    checkout (the clone Lake made of the package that needs it) and to be the one the signed build records. Dies, writing nothing, else."""
+    who = f"{parent}: path dependency {e['name']}"
+    entry = next((p for p in proj.root.get("packages", []) if p.get("name") == e["name"] and p.get("type") == "path"), None)
+    if entry is None or not isinstance(entry.get("dir"), str) or not entry["dir"]:
+        die(f"{who}: Lake's manifest has no path dependency of that name (run `lake update`); refused, nothing written")
+    clone, pdir = clone_dir(proj.dir, proj.root, parent), package_dir(proj.dir, proj.root, parent)
+    if os.path.islink(clone) or not os.path.isdir(clone):
+        die(f"{who}: the checkout {clone} is not a real directory; refused, nothing written")
+    dest = os.path.normpath(os.path.join(proj.dir, entry["dir"]))
+    if os.path.isabs(e["dir"]) or dest != os.path.normpath(os.path.join(pdir, e["dir"])):
+        die(f"{who}: Lake resolved it to {dest}, the signed build records dir {e['dir']!r} from {pdir}; refused, nothing written")
+    rel = os.path.relpath(os.path.abspath(dest), os.path.abspath(clone))
+    parts = [] if rel == "." else rel.split(os.sep)
+    if os.pardir in parts or os.path.isabs(rel) or (parts and parts[0] in (".git", ".lake")):
+        die(f"{who}: {dest} is not inside the pinned checkout {clone} (or is its .git or .lake); refused, nothing written")
+    rc = os.path.realpath(clone)
+    if os.path.normcase(os.path.realpath(dest)) != os.path.normcase(os.path.normpath(os.path.join(rc, *parts))):
+        die(f"{who}: {dest} reaches outside the checkout through a link; refused, nothing written")
+    if not os.path.isdir(dest):
+        die(f"{who}: {dest} is not a directory (run `lake update`); refused, nothing written")
+    return dest
+
+
+class _CapRead:
+    """Reads at most `cap` bytes of a decompressed stream; one more byte is an error (a frame that grows past its declared size)."""
+
+    def __init__(self, f, cap, who):
+        self.f, self.left, self.who = f, cap, who
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n > self.left + 1:
+            n = self.left + 1
+        b = self.f.read(n)
+        self.left -= len(b)
+        if self.left < 0:
+            die(f"{self.who}: the shard decompresses to more than its declared size; refused, nothing written")
+        return b
+
+
+class PathDep:
+    """One path dependency pack of one registry build, authenticated against the signed manifest before anything is written."""
+
+    def __init__(self, reg, proj, parent, build, e):
+        self.dest = path_dep_target(proj, parent, e)
+        clone = clone_dir(proj.dir, proj.root, parent)
+        if not build.man.get("commit") or git(clone, "rev-parse", "HEAD") != build.man["commit"]:
+            die(f"{build.id}: the checkout {clone} is not at the build's commit {str(build.man.get('commit'))[:12]}; refused, nothing written")
+        self.parent = parent
+        self._load(reg, build, e, navigation=True)
+
+    @classmethod
+    def for_checking(cls, reg, build, entry):
+        """Read only authenticated metadata. The checker supplies its temporary extraction directory."""
+        if entry not in path_dep_entries(build.man, build.id):
+            die(f"{build.id}: path dependency is absent from its signed manifest")
+        dep = cls.__new__(cls)
+        dep.dest = None
+        dep.parent = None
+        dep._load(reg, build, entry, navigation=False)
+        return dep
+
+    def _load(self, reg, build, e, navigation):
+        self.reg, self.build, self.e, self.name = reg, build, e, e["name"]
+        self.who = f"{build.id} {build.version}: path dependency {self.name}"
+        self.base = build.base + e["path"]
+        raw = reg.get(self.base + "manifest.json")
+        if sha256(raw) != e["manifest_sha256"]:
+            die(f"{self.who}: manifest.json does not match the SHA-256 in the signed manifest; refused, nothing written")
+        self.man = json.loads(raw)
+        for k in ("commit", "toolchain", "platform"):
+            if self.man.get(k) != build.man.get(k):
+                die(f"{self.who}: its manifest says {k} {self.man.get(k)!r}, the build's says {build.man.get(k)!r}; refused")
+        if self.man.get("schema") not in PATHDEP_SCHEMAS or self.man.get("build_key") != e["build_key"]:
+            die(f"{self.who}: its manifest has another schema or build key than the signed manifest records; refused")
+        shards = self.man.get("shards")
+        if (not isinstance(shards, list) or not shards or not all(
+                isinstance(s, dict) and isinstance(s.get("name"), str) and isinstance(s.get("bytes"), int) and isinstance(s.get("bytes_uncompressed"), int)
+                and isinstance(s.get("sha256"), str) and _HEX64.fullmatch(s["sha256"]) for s in shards)):
+            die(f"{self.who}: its shard list is malformed; refused")
+        self.shards = {s["name"]: s for s in shards}
+        if (len(self.shards) != len(shards) or any(not re.fullmatch(r"shards/[A-Za-z0-9_.-]+\.tar\.zst", n)
+                or s["bytes"] <= 0 or s["bytes_uncompressed"] <= 0 for n, s in self.shards.items())):
+            die(f"{self.who}: malformed or repeated signed shard path")
+        raw = reg.get(self.base + "shards/index.jsonl")
+        if sha256(raw) != e["index_sha256"]:
+            die(f"{self.who}: shards/index.jsonl does not match the SHA-256 in the signed manifest; refused, nothing written")
+        self.index, mods = {}, set()
+        for line in raw.decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if (not isinstance(r, dict) or not isinstance(r.get("path"), str) or not isinstance(r.get("sha256"), str) or not _HEX64.fullmatch(r["sha256"])
+                    or not isinstance(r.get("bytes"), int) or r.get("shard") not in self.shards or r["path"] in self.index):
+                die(f"{self.who}: malformed or repeated entry in shards/index.jsonl; refused")
+            _artifact_parts(r["path"])
+            self.index[r["path"]] = r
+            if isinstance(r.get("module"), str):
+                mods.add(r["module"])
+        if not self.index:
+            die(f"{self.who}: the pack lists no files; refused")
+        # imports: navigation only (not pinned by the signature); a malformed line means "unknown", and an unknown import list takes everything
+        self.mods = {m: None for m in mods}
+        if not navigation:
+            self.mods = dict.fromkeys(self.checked_modules())
+            return
+        raw = reg.get(self.base + "shards/modules.jsonl", missing_ok=True)
+        for line in (raw or b"").decode("utf-8", "replace").splitlines():
+            try:
+                r = json.loads(line)
+                if r["module"] in self.mods and isinstance(r["imports"], list) and all(isinstance(i, str) for i in r["imports"]):
+                    self.mods[r["module"]] = r["imports"]
+            except (ValueError, KeyError, TypeError):
+                continue
+
+    def checked_modules(self):
+        """Module names with a compiled .olean at their canonical signed index path."""
+        return {r["module"] for r in self.index.values() if isinstance(r.get("module"), str)
+                and r["path"] == ".lake/build/lib/lean/" + r["module"].replace(".", "/") + ".olean"}
+
+    def record(self, proj):
+        return {"build_key": self.e["build_key"], "manifest_sha256": self.e["manifest_sha256"], "index_sha256": self.e["index_sha256"],
+                "dest": os.path.relpath(self.dest, proj.dir).replace(os.sep, "/"), "files": len(self.index)}
+
+    def _members(self, body, sname):
+        """(member name, parts, executable, file object) of every member of a shard, each one in the index, none twice."""
+        s = self.shards[sname]
+        seen = set()
+        with _frame_reader(body) as stream:
+            with tarfile.open(fileobj=_CapRead(stream, s["bytes_uncompressed"], self.who), mode="r|", ignore_zeros=True) as tf:
+                for m in tf:
+                    r = self.index.get(m.name)
+                    key = m.name.casefold() if os.name == "nt" else m.name
+                    if r is None or r["shard"] != sname or not m.isreg() or m.sparse is not None or key in seen or m.size != r["bytes"]:
+                        die(f"{self.who}: unexpected archive member {m.name!r}; refused, nothing written")
+                    seen.add(key)
+                    with tf.extractfile(m) as f:
+                        yield m.name, _artifact_parts(m.name), bool(m.mode & 0o100), f
+
+    def prepare(self):
+        """Download every shard and verify the whole pack against the pinned index. Nothing is written; call before anything else is."""
+        bodies = {}
+        for name, s in sorted(self.shards.items()):
+            body = self.reg.get(self.base + name)
+            if len(body) != s["bytes"] or sha256(body) != s["sha256"]:
+                die(f"{self.who}: shard {name} does not match its SHA-256; refused, nothing written")
+            bodies[name] = body
+        got = set()
+        for name, body in bodies.items():            # every member's bytes against the pinned index
+            for path, _parts, _x, f in self._members(body, name):
+                h = hashlib.sha256()
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+                if h.hexdigest() != self.index[path]["sha256"]:
+                    die(f"{self.who}: {path} does not match the index SHA-256; refused, nothing written")
+                got.add(path)
+        if got != set(self.index):
+            die(f"{self.who}: the shards lack {len(set(self.index) - got)} file(s) the index lists; refused, nothing written")
+        self._bodies = bodies
+
+    def install(self):
+        """Write the verified pack into the checkout (prepare() first). Returns the file count."""
+        if self.dest is None:
+            die(f"{self.who}: a checking destination is required")
+        n = 0
+        for name, body in self._bodies.items():
+            for _path, parts, x, f in self._members(body, name):
+                _write_archive_file(self.dest, parts, f, x)
+                n += 1
+        self._bodies = None
+        return n
+
+    def rehash(self):
+        """[(path, state)] of the installed files: 'ok', 'missing', 'differs'."""
+        out = []
+        for path, r in self.index.items():
+            p = os.path.join(self.dest, *path.split("/"))
+            out.append((path, "ok" if os.path.isfile(p) and sha256_file(p) == r["sha256"] else "differs" if os.path.exists(p) else "missing"))
+        return out
+
+
+def attach_path_deps(reg, proj, name, b):
+    """Authenticate and plan the path dependency packs of a registry build of package `name` (not the project's own package)."""
+    b.path_deps = []
+    ents = path_dep_entries(b.man, b.id)
+    if not ents:
+        return
+    if name == proj.root["name"]:
+        print(f"note: {b.id} names path dependenc{'y' if len(ents) == 1 else 'ies'} {', '.join(e['name'] for e in ents)}; the project's own package "
+              "is not built from the registry here, so they are left to Lake", file=sys.stderr)
+        return
+    b.path_deps = [PathDep(reg, proj, name, b, e) for e in ents]
+
+
+def plan(proj, builds, targets, take_all, extra=(), only_named=False, deps_out=None):
     """{lake name: set of modules, or None for all}, plus the list of requested modules and unresolved names.
     extra: modules that declarations resolved to; they are added to the targets. only_named: the install is exactly what
-    was named (modules and declarations), so an empty `targets` does not fall back to the project's own imports."""
+    was named (modules and declarations), so an empty `targets` does not fall back to the project's own imports.
+    deps_out: a set that receives the modules of path dependency packs the closure reaches (they are installed whole, not by module)."""
     owner = {m: n for n, b in builds.items() for m in b.mods}
+    dep_imps = {m: imps for b in builds.values() for d in getattr(b, "path_deps", ()) for m, imps in d.mods.items()}
     if take_all:
-        return {n: None for n in builds}, sorted(owner), []
+        if deps_out is not None:
+            deps_out |= set(dep_imps)
+        return {n: None for n in builds}, sorted(set(owner) | set(dep_imps)), []
     if not targets and not only_named:
         targets = set()
         if proj.root["name"] in builds:
             targets |= set(builds[proj.root["name"]].mods)
         for src in own_sources(proj.dir):
             targets |= set(parse_imports(src))
-        targets = sorted(t for t in targets if t in owner)
+        targets = sorted(t for t in targets if t in owner or t in dep_imps)
     if extra:
         targets = list(targets) + [m for m in extra if m not in targets]
-    need, todo, missing = set(), list(targets), []
+    need, todo, missing, seen_dep = set(), list(targets), [], set()
     while todo:
         m = todo.pop()
-        if m in need:
+        if m in need or m in seen_dep:
+            continue
+        if m in dep_imps:
+            seen_dep.add(m)
+            if dep_imps[m] is None:
+                if deps_out is not None:
+                    deps_out |= set(dep_imps)
+                return {n: None for n in builds}, list(targets), missing   # imports unknown: take all
+            todo += dep_imps[m]
             continue
         if m not in owner:
             if m in targets:
@@ -1220,8 +1700,12 @@ def plan(proj, builds, targets, take_all, extra=(), only_named=False):
         need.add(m)
         imps = builds[owner[m]].mods[m]
         if imps is None:
+            if deps_out is not None:
+                deps_out |= seen_dep
             return {n: None for n in builds}, list(targets), missing   # a module without a parsed header: take all
         todo += imps
+    if deps_out is not None:
+        deps_out |= seen_dep
     return {n: {m for m in need if owner[m] == n} for n in builds}, list(targets), missing
 
 
@@ -1501,7 +1985,8 @@ def train_refusals(proj, builds, notes, train):
 
 
 def do_install(proj, reg, builds, notes, targets, take_all, dry, lock_targets=None, decls=(), only_named=False, rehash=False, admission=None):
-    want, asked, missing = plan(proj, builds, targets, take_all, [d["module"] for d in decls], only_named)
+    dep_need = set()
+    want, asked, missing = plan(proj, builds, targets, take_all, [d["module"] for d in decls], only_named, deps_out=dep_need)
     if decls:
         cw = plan(proj, builds, [], False, [d["module"] for d in decls], True)[0]
         n, size, pk = cone_size(builds, cw)
@@ -1515,6 +2000,20 @@ def do_install(proj, reg, builds, notes, targets, take_all, dry, lock_targets=No
     cache = os.path.join(proj.dir, ".lake", "mreg-cache")
     t0, tot = time.time(), {"modules": 0, "frames": 0, "files": 0, "bytes": 0}
     fetched_now = set()
+    pd_state = state.setdefault("path_dependencies", {})
+    pd_todo = []              # (lake name, build, path dependency, record): the packs to write; each is verified before anything is written
+    for name, b in builds.items():
+        for d in b.path_deps:
+            rec = d.record(proj)
+            wanted = want[name] is None or bool(want[name]) or any(m in dep_need for m in d.mods) or name in state["packages"]
+            if not wanted:
+                continue
+            if (pd_state.get(name) or {}).get(d.name) == rec:
+                print(f"{b.id}: path dependency {d.name}: {len(d.index)} files already installed")
+                continue
+            pd_todo.append((name, b, d, rec))
+            if not dry:
+                d.prepare()
     for name, b in builds.items():
         mods = want[name]
         n_all = len(b.mods)
@@ -1533,6 +2032,19 @@ def do_install(proj, reg, builds, notes, targets, take_all, dry, lock_targets=No
         fetched_now.add(name)
         tot["modules"] += len(need); tot["frames"] += r["frames"]; tot["files"] += r["files"]; tot["bytes"] += r["bytes"]
         state["packages"][name] = {"id": b.id, "version": b.version, "build_key": b.key, "modules": sorted(have | need)}
+    for name, b in builds.items():
+        if b.declared_changes:
+            print(f"note: {b.id} {b.version}: the build records source changes in {', '.join(sorted(b.declared_changes))} (its builder's toolchain bump and "
+                  "train-pin rewrite of the project's files); the clean checkout was bound to the signed rewrite (original and rewritten lake-manifest.json "
+                  "hashes, toolchain before and after); the digest itself is not re-derived, and Lake's no-build check judges the sources")
+    for name, b, d, rec in pd_todo:
+        print(f"{b.id} {b.version}: path dependency {d.name}: {len(d.mods)} modules, {len(d.index)} files into "
+              f"{rec['dest']}/.lake/build (checkout pinned at {b.man['commit'][:12]})")
+        if dry:
+            continue
+        d.install()
+        fetched_now.add(name)
+        pd_state.setdefault(name, {})[d.name] = rec
     for name, why in notes.items():
         if name not in builds and name != proj.root["name"]:
             print(f"{name}: no registry build ({why}); Lake compiles it from source if it is needed")
@@ -1565,6 +2077,7 @@ def do_install(proj, reg, builds, notes, targets, take_all, dry, lock_targets=No
             "targets": sorted(lock_targets if lock_targets is not None else asked), "all_modules": bool(take_all), "packages": []}
     if decls:
         lock["install_level"] = "module"   # what was installed; `declarations` per package is what was asked
+    via = {d.name: n for n, b in builds.items() for d in b.path_deps}
     for name in proj.names:
         e = {"lake_name": name, "role": "root" if name == proj.root["name"] else "dependency", "commit": proj.commit(name)}
         if name in builds:
@@ -1573,6 +2086,8 @@ def do_install(proj, reg, builds, notes, targets, take_all, dry, lock_targets=No
                       "resolve_key": b.man["resolve_key"], "manifest_sha256": b.manifest_sha256, "signed": b.signed,
                       "shards": [{"name": s["name"], "sha256": s["sha256"], "bytes": s["bytes"]} for s in b.man["shards"]],
                       "source_changes": b.man.get("source_changes")})
+            if b.path_deps:
+                e["path_dependencies"] = [dict({"name": d.name, "dir": d.e["dir"]}, **d.record(proj)) for d in b.path_deps]
             ps = proj.status[name]
             e["admission"] = dict(ps["admission"], downloaded=ps["downloaded"], hash_matched=ps["hash_matched"], compatible=ps["compatible"])
             if decls:
@@ -1580,6 +2095,8 @@ def do_install(proj, reg, builds, notes, targets, take_all, dry, lock_targets=No
                                      if d["lake_name"] == name]
                 st = state["packages"].get(name, {})
                 e["modules"] = sorted(st.get("modules", [])) if st.get("build_key") == b.key else []
+        elif name in via:
+            e.update({"from": "registry-path-dependency", "via": via[name]})   # installed from the build of `via`; old clients read it as a source package
         else:
             e["from"] = "source"
         lock["packages"].append(e)
@@ -1645,13 +2162,30 @@ def lc_locked_trains(reg, e):
 
 # ---------------------------------------------------------------- commands
 
+def use_original_modules(a):
+    return a.module_level or (getattr(a, "variant", None) == "full" and not a.chunks and not allow_unverified(a))
+
+
+def named_or_fallback(cmd, a, entries, record=False):
+    try:
+        return ni_run(cmd, a, entries, record=record)
+    except NIError as error:
+        if (error.extra.get("verified_selection_unavailable") and not a.chunks
+                and not os.path.exists(os.path.join(a.dir, CHUNK_LOCK))):
+            notice(a, f"{error.message}. Using original modules.")
+            return None
+        raise
+
+
 def cmd_install(a):
     named = [m for m in a.modules if "#" in m]
     cfgc = (load_cfg(os.path.abspath(a.dir)).get("chunks") or {}).get("declarations")
-    if not a.module_level and (named or (not a.modules and (cfgc or a.upgrade_build))) and             (a.chunks or os.path.exists(os.path.join(os.path.abspath(a.dir), CHUNK_LOCK)) or ni_guard("install", a, lambda: ni_probe(a))):
+    if not use_original_modules(a) and (named or (not a.modules and (cfgc or a.upgrade_build))) and (a.chunks or os.path.exists(os.path.join(os.path.abspath(a.dir), CHUNK_LOCK)) or ni_guard("install", a, lambda: ni_probe(a))):
         if [m for m in a.modules if "#" not in m]:
             die("name either declarations (owner/pkg#Decl) or modules, not both")
-        sys.exit(ni_guard("install", a, lambda: ni_run("install", a, named)))
+        result = ni_guard("install", a, lambda: named_or_fallback("install", a, named))
+        if result is not None:
+            sys.exit(result)
     proj, reg = Project(a.dir), Registry()
     ni_guard("install", a, lambda: reverse_mix(proj.dir, list(proj.names)))
     reg.accept_new_key = a.accept_new_key
@@ -1723,6 +2257,11 @@ def cmd_ci(a):
             for s, t in zip(builds[e["lake_name"]].man["shards"], e["shards"]):
                 if (s["name"], s["sha256"], s["bytes"]) != (t["name"], t["sha256"], t["bytes"]):
                     die(f"{e['id']}: shard list differs from the lock")
+            b = builds[e["lake_name"]]
+            attach_path_deps(reg, proj, e["lake_name"], b)
+            key = lambda r: (r["name"], r["build_key"], r["manifest_sha256"], r["index_sha256"])
+            if sorted(key(r) for r in e.get("path_dependencies") or []) != sorted(key(d.e | {"name": d.name}) for d in b.path_deps):
+                die(f"{e['id']}: its path dependency packs differ from the lock (an older lock holds none: run `mreg install` again)")
     admission = admit_builds(reg, builds, a, "ci")     # run again on every ci, whatever the lock says (an old lock has no admission field)
     # A package locked as "source" has no registry build. That is fine when none of its modules is needed (Mathlib
     # pins lean4-cli but the library never imports it). If one is needed, the `--no-build` check below fails,
@@ -1777,6 +2316,25 @@ def rehash_installed(proj, reg, state, names=None):
                         book += 1; print(f"rewritten by Lake (bookkeeping, not a compiled file) {name}: {e['path']}")
                     else:
                         bad += 1; names_bad.append(f"{name}: {e['path']}"); print(f"MISMATCH {name}: {e['path']}")
+        # the path dependency packs installed for this package (pinned by the signed manifest, which is checked again here)
+        for dname, rec in sorted((state.get("path_dependencies") or {}).get(name, {}).items()):
+            ent = next((x for x in path_dep_entries(man, st["id"]) if x["name"] == dname), None)
+            if ent is None or any(ent[k] != rec[k] for k in ("build_key", "manifest_sha256", "index_sha256")):
+                bad += 1; names_bad.append(f"{name}: path dependency {dname}"); print(f"MISMATCH {name}: path dependency {dname} is not the one the signed manifest records")
+                continue
+            b = _types.SimpleNamespace(id=st["id"], version=st["version"], base=base, man=man, reg=reg, path_deps=[])
+            d = PathDep(reg, proj, name, b, ent)
+            if os.path.normcase(os.path.normpath(os.path.join(proj.dir, rec["dest"]))) != os.path.normcase(d.dest):
+                bad += 1; names_bad.append(f"{name}: path dependency {dname}"); print(f"MISMATCH {name}: path dependency {dname} was installed somewhere else than Lake's directory now")
+                continue
+            for path, res in d.rehash():
+                n += 1
+                if res == "ok":
+                    continue
+                if path.endswith((".hash", ".trace")) and res == "differs":
+                    book += 1; print(f"rewritten by Lake (bookkeeping, not a compiled file) {dname}: {path}")
+                else:
+                    bad += 1; names_bad.append(f"{dname}: {path}"); print(f"MISMATCH {dname} (path dependency of {name}): {path} ({res})")
     return n, bad, book, names_bad
 
 
@@ -1885,16 +2443,65 @@ def cmd_init(a):
     print(f"created {d}: Lake project {name} on train {t['train']} ({t['toolchain']}); next: mreg add <package id>")
 
 
+def _toml(v):
+    return json.dumps(v, ensure_ascii=False)
+
+
+def toml_requires(text, name):
+    """Does the lakefile text already have a [[require]] with this name?"""
+    return any(re.search(r'^\s*name\s*=\s*(?:"%s"|\'%s\')\s*$' % (re.escape(name), re.escape(name)), blk, re.M)
+               for blk in text.split("[[require]]")[1:])
+
+
+def train_pins(reg, t, pid, p):
+    """The git dependencies of a train build, as its signed lake-manifest.json pins them, for a package that is built from a rewritten manifest
+    (a path dependency pack, or a subdirectory package): Lake would otherwise take them at the pins of the package's own, unrewritten manifest.
+    The build is the one the TRAIN names (version, build key, commit); its manifest is checked against the package document and the signature,
+    and the lake-manifest.json against the signed manifest's SHA-256."""
+    version, build_key = p.get("version"), p.get("build_key")
+    doc = reg.json(f"/v1/index/{pid}.json", missing_ok=True) or {}
+    rel = (doc.get("versions") or {}).get(version) or {}
+    ent = next((b for b in rel.get("builds", []) if b.get("build_key") == build_key), None)
+    if ent is None or rel.get("commit") != p.get("commit") or t["train"] not in (ent.get("trains") or []) or not ent.get("signed") or rel.get("yanked"):
+        die(f"{pid}: the train does not name a signed, current build of its own (version {version}, build {build_key})")
+    base = f"/v1/blobs/{pid}/-/{version}/{build_key}/"
+    mraw = reg.get(base + "manifest.json")
+    msha = sha256(mraw)
+    if msha != ent["manifest"]["sha256"]:
+        die(f"{pid} {version}: manifest.json differs from the package document's SHA-256")
+    sigraw = reg.get(base + "manifest.json.sig", missing_ok=True)
+    if sigraw is None:
+        die(f"{pid} {version}: the build is not signed (manifest.json.sig is missing)")
+    sg, problems = check_signature(reg, pid, version, build_key, msha, sigraw)
+    if problems:
+        die(f"{pid} {version}: signature check failed: {problems[0]}")
+    man = json.loads(mraw)
+    if (man.get("id"), man.get("version"), man.get("build_key"), man.get("commit")) != (pid, version, build_key, p.get("commit")) or t["toolchain"] != man.get("toolchain"):
+        die(f"{pid} {version}: the signed manifest names another id, version, build key, commit or toolchain than the train")
+    lraw = reg.get(base + "lake-manifest.json")
+    if sha256(lraw) != (man.get("aux_files") or {}).get("lake-manifest.json", {}).get("sha256"):
+        die(f"{pid} {version}: lake-manifest.json differs from the signed manifest's SHA-256")
+    deps = []
+    for q in json.loads(lraw).get("packages", []):
+        if q.get("type", "git") == "path" or q.get("name") == p["lake_name"]:
+            continue
+        if not (isinstance(q.get("name"), str) and isinstance(q.get("url"), str) and re.fullmatch(r"[0-9a-f]{40}", q.get("rev") or "")):
+            die(f"{pid} {version}: its lake-manifest.json has a dependency without a name, url or full revision")
+        deps.append({"name": q["name"], "git": q["url"], "rev": q["rev"], "subDir": _safe_subdir(q.get("subDir"), q["name"])})
+    return deps
+
+
 def cmd_add(a):
     d = os.path.abspath(a.dir)
-    if any("#" in r for r in a.ids) and not a.module_level:
+    if any("#" in r for r in a.ids) and not use_original_modules(a):
         # declaration-level path when the registry serves a store for the train; else the module-level fallback below
         if a.chunks or os.path.exists(os.path.join(d, CHUNK_LOCK)) or ni_guard("add", a, lambda: ni_probe(a)):
             decl = [r for r in a.ids if "#" in r]
-            rc = ni_guard("add", a, lambda: ni_run("add", a, decl, record=not a.dry_run))
-            a.ids = [r for r in a.ids if "#" not in r]
-            if not a.ids or rc:
-                sys.exit(rc)
+            rc = ni_guard("add", a, lambda: named_or_fallback("add", a, decl, record=not a.dry_run))
+            if rc is not None:
+                a.ids = [r for r in a.ids if "#" not in r]
+                if not a.ids or rc:
+                    sys.exit(rc)
     cfg = load_cfg(d)
     reg = Registry()
     t = get_train(reg, a.train or cfg.get("train"))
@@ -1919,7 +2526,20 @@ def cmd_add(a):
         if re.search(r'name\s*=\s*"%s"' % re.escape(p["lake_name"]), text.split("[[require]]", 1)[-1] if "[[require]]" in text else ""):
             print(f"{pid}: already required"); continue
         text += f'\n[[require]]\nname = "{p["lake_name"]}"\ngit = "{p["git"]}"\nrev = "{p["commit"]}"\n'
-        names.append(p["lake_name"]); print(f"{pid}: require {p['lake_name']} at {p['commit'][:12]} ({p['version']})")
+        sub = p.get("subdir") or ("/".join(pid.split("/")[2:]) if len(pid.split("/")) > 2 else "")
+        if sub:        # <owner>/<repo>/<subdir>: the package is in a subdirectory of the repository, Lake needs its subDir
+            text += f'subDir = {_toml(_safe_subdir(sub, pid))}\n'
+        names.append(p["lake_name"]); print(f"{pid}: require {p['lake_name']} at {p['commit'][:12]} ({p['version']})" + (f" subDir {sub}" if sub else ""))
+        if p.get("path_dependencies"):
+            # its build was made from a lake-manifest.json rewritten to the train's pins: pin the same dependencies here
+            deps = train_pins(reg, t, pid, p)
+            for dep in deps:
+                if not toml_requires(text, dep["name"]):
+                    text += (f'\n[[require]]\nname = {_toml(dep["name"])}\ngit = {_toml(dep["git"])}\nrev = {_toml(dep["rev"])}\n'
+                             + (f'subDir = {_toml(dep["subDir"])}\n' if dep["subDir"] else ""))
+                    names.append(dep["name"])
+            print(f"{pid}: {len(deps)} dependencies pinned from the train build's signed lake-manifest.json; path dependency pack(s): "
+                  + ", ".join(sorted(p["path_dependencies"])))
     atomic_write_text(lf, text)
     if newdecls:
         have = list(cfg.get("declarations") or [])
@@ -2062,13 +2682,16 @@ def declared_line(compiled, declared):
     return f"compiled with {compiled or 'unknown'}; source declares {declared}"
 
 
-def audit_build(reg, pid, version, key, lock_msha, require, docs, strict=False):
+def audit_build(reg, pid, version, key, lock_msha, require, docs, strict=False, receipt_report_pins=False):
     row = {"id": pid, "version": version, "build_key": key, "gates": {}, "labels": [], "problems": [], "signature": "none", "mode": "strict" if strict else "lenient"}
     P = row["problems"]
     if pid not in docs:
         docs[pid] = reg.json(f"/v1/index/{pid}.json", missing_ok=True)
     doc = docs[pid]
-    ent = next((b for b in ((doc or {}).get("versions", {}).get(version, {}).get("builds", [])) if b["build_key"] == key), None)
+    release = (doc or {}).get("versions", {}).get(version, {})
+    ent = next((b for b in release.get("builds", []) if b["build_key"] == key), None)
+    if strict and (release.get("yanked") or (ent or {}).get("yanked")):
+        P.append("the registry has withdrawn this source version or build")
     if ent is None:
         P.append("the package document has no such build")
     base = f"/v1/blobs/{pid}/-/{version}/{key}/"
@@ -2106,6 +2729,16 @@ def audit_build(reg, pid, version, key, lock_msha, require, docs, strict=False):
         P.append("the manifest lists no reports/verify.json (a build from before the gates)")
     else:
         for rel, h in sorted(reps.items()):
+            if receipt_report_pins:
+                parts = rel.split("/")
+                if (len(parts) < 2 or parts[0] != "reports" or any(not _NAME_OK.fullmatch(p) for p in parts[1:])
+                        or not isinstance(h, str) or not _HEX64.fullmatch(h)):
+                    P.append("invalid path or SHA-256 in signed source report inventory")
+                    continue
+                # The signed declaration receipt covered all source report bodies at release.
+                # Re-read the report that drives current gate policy on every install and restore.
+                if rel != "reports/verify.json":
+                    continue
             body = reg.get(base + rel, missing_ok=True)
             if body is None:
                 P.append(f"report {rel} is missing")
@@ -2122,6 +2755,16 @@ def audit_build(reg, pid, version, key, lock_msha, require, docs, strict=False):
                         P.append("the manifest's gates differ from verify.json")
                 except (ValueError, KeyError, AttributeError):
                     P.append("reports/verify.json is malformed")
+    # path dependency packs (the nested modules the build needs, bound by the signed manifest): well formed, every gate of theirs passed
+    try:
+        for pd in path_dep_entries(man, pid):
+            bad = sorted(g for g, v in (pd.get("gates") or {}).items() if v != "pass")
+            if not isinstance(pd.get("gates"), dict) or not pd["gates"] or bad:
+                P.append(f"path dependency {pd['name']}: its own gates are not all pass" + (f" ({', '.join(bad)})" if bad else " (none recorded)"))
+            if pd.get("modules_built") != pd.get("modules_expected"):
+                P.append(f"path dependency {pd['name']}: {pd.get('modules_built')} of {pd.get('modules_expected')} modules built")
+    except SystemExit as e:
+        P.append(str(e).removeprefix("mreg: "))
     # the log: this build's entry, then the chain to the head
     n = (ent or {}).get("log_n")
     if not isinstance(n, int):
@@ -2212,6 +2855,27 @@ def cmd_audit(a):
     require = [g.strip() for g in a.require.split(",") if g.strip()]
     lp = os.path.join(os.path.abspath(a.dir), "mreg.lock")
     lock = json.load(open(lp, encoding="utf-8")) if os.path.exists(lp) else None
+    chunk_lock = _read_json(os.path.join(os.path.abspath(a.dir), CHUNK_LOCK))
+    chunk_row = None
+    if not a.target and chunk_lock and (chunk_lock.get("receipt_sha256") or not lock):
+        def audit_slices():
+            if chunk_lock.get("schema") != CHUNK_LOCK_SCHEMA:
+                raise NIError("error", "unknown declaration lock schema")
+            pin = receipt_pin(None, chunk_lock, chunk_lock["build"], chunk_lock["variant"])
+            if not pin:
+                raise chunk_refusal("`mreg audit` of the chunk lock")
+            admission, _ = validate_chunk_lock(Fetcher(), Store(), a, chunk_lock, pin, full_reports=True)
+            return {"id": "mreg/declaration-slices", "version": chunk_lock["train"], "build_key": chunk_lock["build"],
+                    "ok": True, "gates": {f"C{i}": "pass" for i in range(7)}, "admission": admission,
+                    "labels": ["verified-declarations"], "problems": []}
+        chunk_row = ni_guard("audit", a, audit_slices)
+        if not lock:
+            if a.json:
+                print(json.dumps([chunk_row], indent=1))
+            else:
+                print(f"{chunk_lock['train']} {chunk_lock['build']}: signed kernel-declaration receipt and "
+                      f"{len(chunk_row['admission']['sources'])} source builds passed the strict audit")
+            sys.exit(0)
     todo = []
     if a.target:
         pid, _, ver = a.target.partition("@")
@@ -2228,7 +2892,7 @@ def cmd_audit(a):
         if lock is None:
             die("no mreg.lock here: name a package, `mreg audit <id>[@<version>]`")
         todo = [(e["id"], e["version"], e["build_key"], e["manifest_sha256"]) for e in lock["packages"] if e.get("from") == "registry"]
-    if not todo:
+    if not todo and chunk_row is None:
         die("nothing to audit")
     docs, rows = {}, []
     require_views = _admission_requires_views(a)
@@ -2242,6 +2906,8 @@ def cmd_audit(a):
         adm = locked_adm.get((pid, ver, key))
         if adm:
             rows[-1]["lock_admission"] = adm
+    if chunk_row:
+        rows.append(chunk_row)
     if a.json:
         print(json.dumps(rows, indent=1))
     else:
@@ -2257,7 +2923,7 @@ def cmd_audit(a):
                 print("    - " + p)
             if (r.get("lock_admission") or {}).get("allowed_unverified"):
                 print("    UNVERIFIED: mreg.lock records this build as installed with --allow-unverified (it did not pass the registry's proof policy)")
-        if os.path.exists(os.path.join(os.path.abspath(a.dir), CHUNK_LOCK)):
+        if chunk_lock and not chunk_lock.get("receipt_sha256"):
             print(f"UNVERIFIED: {CHUNK_LOCK} holds declaration chunks: {CHUNK_UNVERIFIED}")
         if strict:
             print(f"audit (strict): {sum(1 for r in rows if r['ok'])} of {len(rows)} builds pass every rule promotion requires "
@@ -2899,7 +3565,7 @@ def cmd_whoami(a):
 # assignment: name, exact_name, module, kind, in_toolchain, chunk   (in_toolchain=1 rows have an empty chunk)
 # chunk_edges: chunk, imports_chunk     manifest: variant, key, id, sha256_raw, bytes_raw, sha256_stored, bytes_stored, n_decls
 
-import array as _array, gzip as _gzip, sqlite3 as _sqlite3, tempfile as _tempfile, pathlib as _pathlib, shutil
+import array as _array, gzip as _gzip, sqlite3 as _sqlite3, tempfile as _tempfile, pathlib as _pathlib, shutil, zlib
 
 NI_SCHEMA = "mreg-named-import/1"
 CHUNK_LOCK = "mreg-chunks.lock.json"
@@ -3075,14 +3741,14 @@ class Fetcher:
         raise RangeError("status", f"HTTP {st} for a range of {path}", retry=st in (429, 500, 502, 503, 504),
                          retry_after=retry_after_of(r.headers) if st in (429, 503) else None)
 
-    def get(self, path):
+    def get(self, path, max_bytes=None):
         # TEST ONLY: MREG_TEST_POINTER_FILE serves a local file in place of the pointer (`<registry>/x/decl/<train>/current.json`), so a
         # pointer can be tried through the real client before it is published. Everything else still goes to the registry.
         tp = os.environ.get("MREG_TEST_POINTER_FILE")
         if tp and path.startswith("/x/decl/") and path.endswith("/current.json") and path.count("/") == 4:
             try:
                 with open(tp, "rb") as f:
-                    body = f.read()
+                    body = f.read() if max_bytes is None else f.read(max_bytes + 1)
             except OSError as e:
                 raise NIError("network", f"cannot read MREG_TEST_POINTER_FILE: {e}")
             self._count(len(body))
@@ -3091,7 +3757,7 @@ class Fetcher:
             p = os.path.join(self.root, *[x for x in path.split("/") if x])
             try:
                 with open(p, "rb") as f:
-                    body = f.read()
+                    body = f.read() if max_bytes is None else f.read(max_bytes + 1)
             except (FileNotFoundError, NotADirectoryError):
                 self._count(0)
                 raise NIError("missing_object", f"404: {path}", path=path)
@@ -3106,7 +3772,7 @@ class Fetcher:
         for attempt in range(self.retries + 1):
             try:
                 with _safe_redirect_open(urllib.request.Request(self.base + path, headers=h), timeout=self.timeout) as r:
-                    body = r.read()
+                    body = r.read() if max_bytes is None else r.read(max_bytes + 1)
                 self._count(len(body))
                 return body
             except urllib.error.HTTPError as e:
@@ -3403,24 +4069,25 @@ class Lookup:
                 "n_decls": r[4]}
 
 
-def read_pointer(f, train):
+def read_pointer(f, train, path=None):
     """current.json of a train, validated. A missing pointer is `not_on_train` (the registry serves no declaration store: the
     caller may fall back to the module-level path). A pointer that exists but is unusable (not JSON, wrong schema, no index
     hashes) is `index_unavailable`, never a fallback."""
+    path = path or ni_path(train)
     try:
-        ptr = f.json(ni_path(train))
+        ptr = f.json(path)
     except NIError as e:
         if _not_found(e):
             raise NIError("not_on_train", f"train {train} has no declaration-level store on this registry "
-                          f"({ni_path(train)} is absent)")
+                          f"({path} is absent)")
         if e.kind == "error":
-            raise NIError("index_unavailable", f"{ni_path(train)} is not JSON; no answer can be computed (not a 'not found')")
+            raise NIError("index_unavailable", f"{path} is not JSON")
         raise
     ix = ptr.get("index_sha256") if isinstance(ptr, dict) else None
     if (not isinstance(ptr, dict) or ptr.get("schema") != POINTER_SCHEMA or ptr.get("train") != train
             or not _NAME_OK.match(str(ptr.get("build", ""))) or not _HEX64.match(str(ptr.get("manifest_sha256", "")))
             or not isinstance(ptr.get("variants"), list)):
-        raise NIError("index_unavailable", f"{ni_path(train)} is not a {POINTER_SCHEMA} pointer for train {train}; "
+        raise NIError("index_unavailable", f"{path} is not a {POINTER_SCHEMA} pointer for train {train}; "
                       "no answer can be computed (not a 'not found')")
     if (not isinstance(ix, dict) or any(not _HEX64.match(str(ix.get(k, ""))) for k in INDEX_FILES)):
         raise NIError("index_unavailable", f"the pointer {ni_path(train)} carries no sha256 for each of {', '.join(INDEX_FILES)} "
@@ -3429,6 +4096,117 @@ def read_pointer(f, train):
         raise NIError("index_unavailable", "the pointer's manifest_sha256 and index_sha256['manifest.tsv.gz'] differ; refused")
     ptr["index_sha256"] = {k: ix[k] for k in INDEX_FILES}
     return ptr
+
+
+def source_route(f, train, train_doc, package, supplied_digest=None):
+    if not all(_NAME_OK.fullmatch(part) for part in package.split("/")):
+        raise NIError("error", "invalid package identity in declaration selection")
+    record = (train_doc.get("packages") or {}).get(package, {})
+    version, key = record.get("version"), record.get("build_key")
+    if key is None and not supplied_digest:  # Older train catalogues predate exact source-build selection.
+        return None
+    if not supplied_digest and not all(isinstance(x, str) and _NAME_OK.fullmatch(x) for x in (version, key)):
+        raise NIError("index_unavailable", f"invalid train source selection for {package}")
+    try:
+        doc = f.json(f"/v1/index/{package}.json")
+    except NIError as ex:
+        if _not_found(ex):
+            raise NIError("index_unavailable", f"catalogue document for {package} on {train} is missing") from ex
+        raise
+    if not isinstance(doc, dict) or not isinstance(doc.get("versions"), dict):
+        raise NIError("index_unavailable", f"invalid catalogue document for {package}")
+    if supplied_digest:
+        matches = [(v, b.get("build_key")) for v, release in doc["versions"].items()
+                   if isinstance(release, dict) for b in release.get("builds", []) if isinstance(b, dict)
+                   and isinstance(b.get("manifest"), dict) and b["manifest"].get("sha256") == supplied_digest]
+        if len(matches) != 1 or not all(isinstance(x, str) and _NAME_OK.fullmatch(x) for x in matches[0]):
+            raise NIError("hash_mismatch", f"expected one catalogue build for {package} at the requested manifest digest")
+        version, key = matches[0]
+    release = doc["versions"].get(version)
+    builds = release.get("builds") if isinstance(release, dict) else None
+    if not isinstance(builds, list) or not all(isinstance(b, dict) for b in builds):
+        raise NIError("index_unavailable", f"invalid catalogue build list for {package}")
+    matches = [b for b in builds if b.get("build_key") == key]
+    if len(matches) != 1:
+        raise NIError("hash_mismatch", f"train source build for {package} is absent or ambiguous in the catalogue")
+    if release.get("yanked") or matches[0].get("yanked"):
+        raise NIError("unverified_refused", f"the registry has withdrawn the requested version or build of {package}")
+    digest = (matches[0].get("manifest") or {}).get("sha256")
+    if not isinstance(digest, str) or not _HEX64.fullmatch(digest):
+        raise NIError("hash_mismatch", f"missing source manifest digest for {package}")
+    return {"id": package, "version": version, "build_key": key, "manifest_sha256": digest}
+
+
+def discover_store(f, train, train_doc, entries, asked, supplied_digest=None):
+    """Select one store whose admitted source identity matches the requested catalogue build."""
+    packages = sorted({p[0] for entry in entries if (p := parse_decl(entry))})
+    if asked and not _NAME_OK.fullmatch(asked):
+        raise NIError("error", "invalid declaration store build")
+    if supplied_digest is not None and (not _HEX64.fullmatch(supplied_digest) or len(packages) != 1):
+        raise NIError("error", "--source-manifest-sha256 requires one named package and a SHA-256 digest")
+    sources = [s for p in packages if (s := source_route(f, train, train_doc, p, supplied_digest))]
+    explicit_release = None
+    if asked:
+        try:
+            selected = read_pointer(f, train, ni_path(train, asked, "release.json"))
+        except NIError as ex:
+            if ex.kind != "not_on_train":
+                raise
+        else:
+            if selected["build"] != asked or not receipt_pin(selected, None, asked, "checking"):
+                raise NIError("hash_mismatch", "immutable store descriptor names another build or lacks a receipt")
+            explicit_release = selected
+        if explicit_release is None:
+            current = read_pointer(f, train)
+            if current["build"] != asked:
+                raise NIError("not_on_train", f"no immutable release descriptor for requested build {asked} on {train}")
+            return current, sources if receipt_pin(current, None, asked, "checking") else [], False
+    selected = None
+    routed = set()
+    for source in sources:
+        path = ni_path(train, "by-source", source["manifest_sha256"] + ".json")
+        try:
+            ptr = read_pointer(f, train, path)
+        except NIError as ex:
+            if ex.kind == "not_on_train":
+                continue
+            raise
+        if not receipt_pin(ptr, None, ptr["build"], "checking"):
+            raise NIError("unverified_refused", "by-source declaration store has no signed receipt")
+        if explicit_release and ptr != explicit_release:
+            raise NIError("hash_mismatch", "source alias differs from the requested immutable release descriptor")
+        if selected and selected != ptr:
+            raise NIError("forbidden_mix", "the requested declarations select different signed declaration stores")
+        selected = ptr
+        routed.add(source["id"])
+    if selected or explicit_release:
+        if routed != set(packages):
+            raise NIError("hash_mismatch", "a requested package lacks its own source alias for this declaration store")
+        return selected, sources, False
+    current = read_pointer(f, train)
+    if supplied_digest and not receipt_pin(current, None, current["build"], "checking"):
+        raise NIError("unverified_refused", "exact source selection requires a signed declaration store")
+    signed = receipt_pin(current, None, current["build"], "checking")
+    return current, sources if signed else [], not supplied_digest
+
+
+def verify_routed_sources(routes, admission, allow_unserved=False):
+    if not isinstance(routes, list):
+        raise NIError("hash_mismatch", "malformed exact source selection")
+    owners = {s["id"]: s for s in admission["sources"]}
+    missing = []
+    for route in routes:
+        keys = {"id", "version", "build_key", "manifest_sha256"}
+        if not isinstance(route, dict) or set(route) != keys or not isinstance(route["id"], str):
+            raise NIError("hash_mismatch", "malformed exact source selection")
+        source = owners.get(route["id"])
+        if source is None and allow_unserved:
+            missing.append(route["id"])
+        elif not source or any(source.get(k) != route[k] for k in keys):
+            raise NIError("hash_mismatch", "requested catalogue source build differs from the signed declaration receipt")
+    if missing:
+        raise NIError("not_on_train", "the default declaration store does not serve " + ", ".join(missing),
+                      verified_selection_unavailable=True)
 
 
 def want_from_lock(lock):
@@ -3613,12 +4391,14 @@ def resolve_entry(lk, train_doc, entry):
     if p is None:
         raise NIError("not_on_train", f"{pid} is not on train {train_doc['train']}", package=pid)
     roots = set(p.get("module_roots") or [])
+    modules = p.get("owned_modules")
     rows = lk.find(name)
     if not rows:
         sug = lk.suggest(name)
         raise NIError("unknown_declaration", f"{entry}: no declaration {name!r} in this train's index" +
                       (f"; did you mean {', '.join(sug)}" if sug else ""), suggestions=sug)
-    mine = [r for r in rows if not r["in_toolchain"] and _root(r["module"]) in roots]
+    mine = [r for r in rows if not r["in_toolchain"]
+            and (r["module"] in modules if modules is not None else _root(r["module"]) in roots)]
     note = None
     if mine:
         keys = {(r["exact_name"], r["chunk"]) for r in mine}
@@ -4267,6 +5047,104 @@ def installed_chunk_files(chunk_dir):
     return out
 
 
+def verified_project_path(project, path):
+    """A dedicated local path inside the project, without symlink or junction traversal."""
+    base = _pathlib.Path(project).absolute()
+    dest = _pathlib.Path(os.path.abspath(path))
+    if dest == base or not dest.is_relative_to(base):
+        raise NIError("forbidden_mix", f"verified artifact path is outside the project: {path}")
+    here = base
+    for part in dest.relative_to(base).parts:
+        if any(ord(c) < 32 for c in part):
+            raise NIError("forbidden_mix", "a verified artifact path contains a control character")
+        here = here / part
+        if here.is_symlink() or getattr(os.path, "isjunction", lambda p: False)(here):
+            raise NIError("forbidden_mix", f"verified artifact path traverses a link: {here}")
+    return dest
+
+
+def inspect_verified_tree(project, chunk_dir, entries):
+    dest = verified_project_path(project, chunk_dir)
+    if not dest.exists():
+        return
+    allowed = {chunk_rel(e["id"]) for e in entries}
+    allowed.update({MARKER, "THIRD_PARTY_LICENSES.txt"})
+    folders = {"Mreg"} | {p.rpartition("/")[0] for p in allowed}
+    def unreadable(error):
+        raise NIError("forbidden_mix", f"cannot inspect verified Lean search path: {error}")
+    if not dest.is_dir():
+        raise NIError("forbidden_mix", f"verified Lean search path is not a directory: {dest}")
+    for base, dirs, files in os.walk(dest, onerror=unreadable):
+        for name in dirs + files:
+            p = _pathlib.Path(base, name)
+            rel = p.relative_to(dest).as_posix()
+            valid = rel in folders if name in dirs else rel in allowed and p.is_file() and p.stat().st_nlink == 1
+            if not valid or p.is_symlink() or getattr(os.path, "isjunction", lambda path: False)(p):
+                raise NIError("forbidden_mix", f"unexpected file, directory or link in the verified Lean search path: {p}")
+
+
+def verified_entry(project, chunk_dir, rel):
+    path = verified_project_path(project, os.path.join(project, rel))
+    if (path.suffix != ".lean" or path.is_relative_to(_pathlib.Path(chunk_dir))
+            or any(part.startswith(".") for part in path.relative_to(_pathlib.Path(project)).parts)):
+        raise NIError("forbidden_mix", "verified entry must be a project Lean source outside the chunk directory")
+    return path
+
+
+def verified_entry_bytes(decls):
+    modules = dict.fromkeys(chunk_module(r["chunk"]) for r in decls if r["chunk"] is not None)
+    return ("-- Generated by mreg from the signed declaration selection.\n" +
+            "".join(f"import {module}\n" for module in modules)).encode("utf-8")
+
+
+def generated_entry_bytes(declarations, signed, train, build, variant, rel_dir):
+    if signed:
+        return verified_entry_bytes(declarations)
+    lines = [f"-- generated by mreg ({CHUNK_LOCK}): train {train}, build {build}, {variant} chunks. Do not edit.",
+             f"-- LEAN_PATH must contain {rel_dir} (`mreg env`).",
+             "-- " + SUPPORTS]
+    seen = set()
+    for r in declarations:
+        if r["chunk"] is None:
+            lines.append(f"-- {r['entry']}: provided by the toolchain ({r['module']}), nothing to import")
+        elif r["chunk"] not in seen:
+            seen.add(r["chunk"])
+            lines.append(f"import {chunk_module(r['chunk'])}  -- {r['entry']}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def update_generated_entry(path, desired, previous, *, write):
+    """Update only a known generated file. Publish a new file without replacing a concurrent create."""
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise NIError("forbidden_mix", f"generated entry is not a regular file: {path}")
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        if not write:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _tmp_name(str(path))
+        try:
+            with open(tmp, "xb") as stream:
+                stream.write(desired)
+            try:
+                if os.name == "nt":
+                    os.rename(tmp, path)
+                else:
+                    os.link(tmp, path)
+                return
+            except FileExistsError:
+                current = path.read_bytes()
+        finally:
+            _pathlib.Path(tmp).unlink(missing_ok=True)
+    if current == desired:
+        return
+    if previous is None or current != previous:
+        raise NIError("forbidden_mix", f"{path} contains existing or edited source. Choose a different --entry or use --no-entry.")
+    if write:
+        atomic_write(str(path), desired)
+
+
 def ni_out(a, payload, human):
     payload.setdefault("supports", SUPPORTS)
     if getattr(a, "json", False):
@@ -4334,15 +5212,490 @@ def budget_check(a, missing, cone_chunks, bytes_stored, bytes_raw, dry):
 
 
 def chunk_refusal(what):
-    return NIError("unverified_refused", f"{CHUNK_UNVERIFIED}; {what} refused, nothing was fetched or installed. Use --module-level to install "
+    return NIError("unverified_refused", f"{CHUNK_UNVERIFIED}; {what} refused before fetching declaration payloads. Use --module-level to install "
                    "the declaration's module from a checked build, or pass --allow-unverified to install the chunks anyway "
                    "(they stay marked UNVERIFIED)", experimental_chunks=True, proof_checked_under_policy=False)
 
 
 def chunk_admission():
-    """The admission record of a chunk install: never proof checked under the policy; the lock says why."""
+    """Admission record for an explicitly permitted legacy store without a receipt."""
     return {"policy": ADMISSION_POLICY, "proof_checked_under_policy": False, "experimental_chunks": True, "allowed_unverified": True,
             "problems": [CHUNK_UNVERIFIED]}
+
+
+def compact_pin(pointer, lock, build, variant):
+    values = []
+    field = "compact_index_sha256"
+    if pointer and pointer["build"] == build and field in pointer:
+        pins = pointer[field]
+        if not isinstance(pins, dict) or not pins or any(
+                key not in pointer["variants"] or not isinstance(value, str) or not _HEX64.fullmatch(value)
+                for key, value in pins.items()):
+            raise NIError("hash_mismatch", "malformed compact index pins in the declaration pointer")
+        if variant in pins:
+            values.append(pins[variant])
+    if lock and lock["build"] == build and field in lock:
+        values.append(lock[field])
+    if any(not isinstance(value, str) or not _HEX64.fullmatch(value) for value in values) or len(set(values)) > 1:
+        raise NIError("hash_mismatch", "invalid or conflicting compact index digest for immutable declaration build")
+    return values[0] if values else None
+
+
+def receipt_pin(pointer, lock, build, variant):
+    old = lock.get("receipt_sha256") if lock and lock["build"] == build else None
+    pins = pointer.get("receipt_sha256", {}) if pointer and pointer["build"] == build else {}
+    if not isinstance(pins, dict):
+        raise NIError("hash_mismatch", "invalid receipt digests on declaration pointer")
+    advertised = pins.get(variant)
+    for value in (advertised, old):
+        if value is not None and (not isinstance(value, str) or not _HEX64.fullmatch(value)):
+            raise NIError("hash_mismatch", "invalid declaration receipt SHA-256")
+    if old and advertised and old != advertised:
+        raise NIError("hash_mismatch", "the receipt digest changed for an immutable declaration build")
+    if compact_pin(pointer, lock, build, variant) and not (old or advertised):
+        raise NIError("unverified_refused", "a compact index requires a signed declaration receipt")
+    return old or advertised
+
+
+def check_embedded_sources(reg, base, man, src, train, reserved_modules=None):
+    """Bind a v2 receipt's embedded module selection to its authenticated parent build."""
+    from types import SimpleNamespace
+    def refuse(reason):
+        raise NIError("unverified_refused", f"{src['id']}: {reason}")
+    selected = src.get("embedded_dependencies", [])
+    fields = {"lake_name", "build_key", "manifest_sha256", "index_sha256", "verify_sha256", "modules"}
+    if not isinstance(selected, list) or ("embedded_dependencies" in src and not selected):
+        refuse("invalid embedded dependency selection")
+    if not man.get("path_dependencies") and not selected:
+        return []
+    if not re.fullmatch(r"[0-9a-f]{40}", str(man.get("commit", ""))) or not man.get("platform"):
+        refuse("parent has no build platform or commit")
+    build = SimpleNamespace(id=src["id"], version=src["version"], base=base, man=man)
+    try:
+        entries = {e["name"]: e for e in path_dep_entries(man, src["id"])}
+        raw = reg.get(base + "shards/index.jsonl")
+        if sha256(raw) != src["index_sha256"]:
+            refuse("parent module index hash mismatch")
+        own = set()
+        for line in raw.splitlines():
+            if line.strip():
+                row = json.loads(line)
+                mod = row.get("module")
+                if isinstance(mod, str) and row["path"] == ".lake/build/lib/lean/" + mod.replace(".", "/") + ".olean":
+                    own.add(mod)
+        if not set(src["modules"]).issubset(own):
+            refuse("claimed parent module is absent from its signed module index")
+        seen_names = set()
+        reserved = set() if reserved_modules is None else reserved_modules
+        parent_closure = dict(man["closure"])
+        if len(parent_closure) != len(man["closure"]):
+            refuse("duplicate dependency in signed parent closure")
+        nested_edges = {}
+        for pin in selected:
+            if not isinstance(pin, dict) or set(pin) != fields or not isinstance(pin["lake_name"], str):
+                refuse("malformed embedded dependency")
+            name, mods = pin["lake_name"], pin["modules"]
+            e = entries.get(name)
+            if (not e or name in seen_names or not isinstance(mods, list)
+                    or not all(isinstance(m, str) and m and not any(c in m for c in "/\\\x00") for m in mods)
+                    or mods != sorted(set(mods)) or own.intersection(mods)
+                    or any(pin[k] != e.get(k) for k in ("build_key","manifest_sha256","index_sha256","verify_sha256"))
+                    or not _HEX64.fullmatch(str(pin["verify_sha256"]))):
+                refuse("embedded dependency differs from its signed parent")
+            seen_names.add(name)
+            dep = PathDep.for_checking(reg, build, e)
+            all_nested = set(dep.mods)
+            if (not all_nested or dep.man.get("package") != name or not man.get("source_repo")
+                    or dep.man.get("source_repo") != man["source_repo"] or not set(mods).issubset(all_nested)):
+                refuse("embedded module is absent from its authenticated compiled index")
+            if own.intersection(all_nested) or reserved.intersection(all_nested):
+                refuse("embedded modules overlap another signed source")
+            reserved.update(all_nested)
+            for row in dep.index.values():
+                if row["path"].endswith(".olean"):
+                    mod = row["module"]
+                    if (mod not in all_nested or not all(mod.split(".")) or mod.split(".")[0] in {"Lean","Init","Std","Lake","Mreg"}
+                            or any(c.isspace() or ord(c)<32 or c in "/\\" for c in mod)
+                            or row["path"] != ".lake/build/lib/lean/" + mod.replace(".","/") + ".olean"):
+                        refuse("invalid embedded compiled module path")
+            closure = dict(dep.man["closure"])
+            if (len(closure) != len(dep.man["closure"]) or closure.get(name) != "" or parent_closure.get(name) != ""
+                    or any(parent_closure.get(k) != v or k == man.get("package")
+                           or (k not in entries and not re.fullmatch(r"[a-f0-9]{40}",v)) for k,v in closure.items())):
+                refuse("embedded dependency closure differs from its signed parent")
+            nested_edges[name] = set(closure).intersection(entries) - {name}
+            raw = reg.get(dep.base + "reports/verify.json")
+            if sha256(raw) != pin["verify_sha256"]:
+                refuse("embedded verification report hash mismatch")
+            report = json.loads(raw)
+            gates = {f"G{i}": "pass" for i in range(1,11)}
+            identity = {"schema":"mreg-verify/1","package":name,"id":src["id"],"version":src["version"],
+                        "build_key":pin["build_key"],"index_sha256":pin["index_sha256"],"modules":len(all_nested),
+                        **{k:man[k] for k in ("commit","toolchain","platform")}}
+            views = report["views"]
+            if (any(report.get(k) != v for k,v in identity.items()) or e.get("gates") != gates
+                    or any(report["gates"].get(k, {}).get("status") != v for k,v in gates.items())
+                    or views.get("schema") != "mreg-views/1" or views.get("status") != "pass"
+                    or views.get("problems") != 0 or views.get("lean") != train.removeprefix("lean-")
+                    or views.get("modules_checked") != len(all_nested) or views.get("modules") != len(all_nested)
+                    or views.get("index_sha256") != pin["index_sha256"]
+                    or not all(_HEX64.fullmatch(str(views.get(k,""))) for k in ("sha256","checker_sha256","files_sha256"))):
+                refuse("embedded gates, views or source identity differ from the signed build")
+            views_raw = reg.get(dep.base + "reports/views.json")
+            if sha256(views_raw) != views["sha256"] or report["reports"].get("reports/views.json") != views["sha256"]:
+                refuse("embedded views report hash mismatch")
+            census = json.loads(views_raw)
+            if (any(census.get(k) != views[k] for k in ("schema","status","index_sha256","checker_sha256","files_sha256",
+                                                         "lean","modules","modules_checked"))
+                    or census.get("binding_problems") != [] or census.get("reasons") != []
+                    or census["totals"].get("problem_count") != 0
+                    or sorted(r["module"] for r in census["rows"]) != sorted(all_nested)):
+                refuse("embedded views census differs from signed module index")
+        if seen_names != set(entries):
+            refuse("receipt omits a dependency bound by the signed parent manifest")
+        resolved = set()
+        while len(resolved) < len(nested_edges):
+            ready = {n for n,deps in nested_edges.items() if n not in resolved and deps <= resolved}
+            if not ready:
+                refuse("cyclic embedded dependencies")
+            resolved.update(ready)
+    except (KeyError, AttributeError, TypeError, ValueError, UnicodeError, SystemExit) as ex:
+        refuse("invalid signed embedded dependency metadata: " + str(ex))
+    return selected
+
+
+def admit_chunk_receipt(f, a, train, build, variant, toolchain, want, pin, receipt_report_pins=False):
+    """Authenticate the derived product and recheck the admission of its exact source builds."""
+    path = ni_path(train, build, variant, "chunk-receipt.json")
+    raw = f.get(path)
+    if sha256(raw) != pin:
+        raise NIError("hash_mismatch", "declaration receipt differs from its SHA-256")
+    reg = Registry()
+    reg.accept_new_key = bool(getattr(a, "accept_new_key", False))
+    sg, problems = check_signature(reg, "mreg/declaration-slices", train, build + "-" + variant, pin, f.get(path + ".sig"))
+    if problems or sg["labels"] != ["verified-declarations"]:
+        raise NIError("unverified_refused", "invalid declaration receipt signature: " + "; ".join(problems or ["wrong labels"]))
+    receipt = json.loads(raw)
+    schema = receipt.get("schema")
+    if schema not in ("mreg-chunk-receipt/1", "mreg-chunk-receipt/2"):
+        raise NIError("unverified_refused", "unknown declaration receipt schema")
+    expected = {"train": train, "build": build, "variant": variant,
+                "capability": "kernel-declarations", "toolchain": toolchain, "index_sha256": want,
+                "manifest_sha256": want["manifest.tsv.gz"], "gates": {f"C{i}": "pass" for i in range(7)}}
+    if variant != "checking" or any(receipt.get(k) != v for k, v in expected.items()):
+        raise NIError("unverified_refused", "declaration receipt does not cover the selected indexes, policy, variant and toolchain")
+    counts, kernels, exclusions = (receipt.get(k, {}) for k in ("counts", "kernels", "exclusions"))
+    tool_hashes = receipt.get("tools_sha256", {})
+    if (not all(isinstance(obj, dict) for obj in (counts, kernels, exclusions, tool_hashes))
+            or counts.get("problems") != 0 or counts.get("uncovered") != 0
+            or not isinstance(counts.get("constants"), int) or counts["constants"] < 1
+            or not isinstance(counts.get("chunks"), int) or counts["chunks"] < 1
+            or counts.get("chunks_read") != counts["chunks"] or kernels.get("status") != "pass"
+            or kernels.get("modules") != counts["chunks"] or kernels.get("declarations") != counts["constants"]
+            or not isinstance(kernels.get("second_kernel_checked"), int) or kernels["second_kernel_checked"] < counts["constants"]
+            or not isinstance(exclusions.get("count"), int) or exclusions["count"] < 0 or exclusions["count"] != counts.get("excluded")
+            or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("toolchain_commit", "")))
+            or not tool_hashes or not all(_HEX64.fullmatch(str(h)) for h in
+                [receipt.get("files_sha256"), exclusions.get("sha256"), *tool_hashes.values()])):
+        raise NIError("unverified_refused", "declaration receipt has incomplete verification coverage")
+    sources = receipt.get("sources")
+    dependencies = receipt.get("dependency_sources", [])
+    if not isinstance(sources, list) or not sources or not isinstance(dependencies, list):
+        raise NIError("unverified_refused", "declaration receipt has no source builds")
+    embedded = any(isinstance(s, dict) and "embedded_dependencies" in s for s in sources + dependencies)
+    if embedded != (schema == "mreg-chunk-receipt/2"):
+        raise NIError("unverified_refused", "embedded dependencies require declaration receipt version 2")
+    docs, packages, pins, dependency_pins, lake_names, contributing_modules = {}, {}, [], [], set(), set()
+    source_ids, all_modules = set(), set()
+    notices = bytearray()
+    for position, src in enumerate(sources + dependencies):
+        dependency = position >= len(sources)
+        if not isinstance(src, dict):
+            raise NIError("unverified_refused", "malformed source build in declaration receipt")
+        pid, version, key = (src.get(k, "") for k in ("id", "version", "build_key"))
+        lake_name, modules = src.get("lake_name"), src.get("modules")
+        if (not isinstance(pid, str) or len(pid.split("/")) < 2
+                or not all(isinstance(s, str) and _NAME_OK.fullmatch(s) for s in [*pid.split("/"), version, key])
+                or not all(_HEX64.fullmatch(str(src.get(k, ""))) for k in ("manifest_sha256", "index_sha256"))
+                or not isinstance(lake_name, str) or not lake_name or lake_name in lake_names or pid in source_ids
+                or src.get("dependency_only", False) is not dependency
+                or not isinstance(modules, list) or (not modules and not src.get("embedded_dependencies"))
+                or not all(isinstance(m, str) and m for m in modules)
+                or len(set(modules)) != len(modules) or all_modules.intersection(modules)):
+            raise NIError("unverified_refused", "declaration receipt has invalid or conflicting source ownership")
+        required = [g.strip() for g in getattr(a, "require", "").split(",") if g.strip()]
+        row = audit_build(reg, pid, version, key, src["manifest_sha256"], required, docs, strict=True,
+                         receipt_report_pins=receipt_report_pins)
+        views = row.get("views")
+        supplemental = src.get("supplemental_views") or {}
+        verified_views = (isinstance(supplemental, dict) and supplemental.get("schema") == "mreg-views/1"
+                          and supplemental.get("status") == "pass" and supplemental.get("problems") == 0
+                          and supplemental.get("lean") == train.removeprefix("lean-")
+                          and supplemental.get("modules") == supplemental.get("modules_checked") == len(modules)
+                          and supplemental.get("index_sha256") == src["index_sha256"]
+                          and supplemental.get("report_sha256") == supplemental.get("sha256")
+                          and all(_HEX64.fullmatch(str(supplemental.get(k, "")))
+                                  for k in ("sha256", "checker_sha256", "files_sha256")))
+        if not row["ok"] or not (views == "pass" or (views in (None, "not run") and verified_views)):
+            raise NIError("unverified_refused", f"{pid} no longer passes signed source admission and views")
+        base = f"/v1/blobs/{pid}/-/{version}/{key}/"
+        manraw = reg.get(base + "manifest.json")
+        man = json.loads(manraw)
+        index = man.get("aux_files", {}).get("shards/index.jsonl", {})
+        if (sha256(manraw) != src["manifest_sha256"] or index.get("sha256") != src["index_sha256"]
+                or norm_toolchain(man.get("toolchain")) != norm_toolchain(toolchain)):
+            raise NIError("hash_mismatch", f"{pid}: source index or toolchain differs from its declaration receipt")
+        source_notice = bytearray(f"\n{pid} {version} ({key})\n".encode("utf-8"))
+        for name, field in (("LICENSE", "license_sha256"), ("NOTICE", "notice_sha256")):
+            digest = man.get(field)
+            if digest is None:
+                continue
+            body = reg.get(base + name, missing_ok=True)
+            if body is None or sha256(body) != digest:
+                raise NIError("hash_mismatch", f"{pid}: {name} is absent or differs from its signed source manifest")
+            source_notice.extend(name.encode("ascii") + b"\n" + body + b"\n")
+        lake_names.add(lake_name)
+        source_ids.add(pid)
+        all_modules.update(modules)
+        exact = {k: src[k] for k in ("id", "lake_name", "version", "build_key", "manifest_sha256", "index_sha256")}
+        if embedded:
+            nested = check_embedded_sources(reg, base, man, src, train, all_modules)
+            if not modules and (views != "pass" or not any(child["modules"] for child in nested)):
+                raise NIError("unverified_refused", "empty source requires native views and selected embedded modules")
+            if nested:
+                exact["embedded_dependencies"] = nested
+            for child in nested:
+                if child["lake_name"] in lake_names:
+                    raise NIError("unverified_refused", "conflicting embedded package or module in declaration receipt")
+                lake_names.add(child["lake_name"])
+                if not dependency:
+                    contributing_modules.update(child["modules"])
+        if dependency:
+            dependency_pins.append(exact)
+        else:
+            notices.extend(source_notice)
+            contributing_modules.update(modules)
+            packages[pid] = {"lake_name": lake_name, "owned_modules": set(modules)}
+            pins.append(exact)
+    if counts.get("source_modules") != len(contributing_modules):
+        raise NIError("unverified_refused", "receipt source module count differs from its ownership table")
+    return {"train": train, "toolchain": toolchain, "packages": packages, "notices": bytes(notices)}, {
+        "policy": ADMISSION_POLICY, "proof_checked_under_policy": True, "experimental_chunks": False,
+        "allowed_unverified": False, "problems": [], "capability": "kernel-declarations", "sources": pins,
+        "receipt_sha256": pin, "key_id": sg["key_id"], "exclusions": exclusions, "dependency_sources": dependency_pins,
+        "source_report_verification": ("gate report bytes and signed report digests" if receipt_report_pins
+                                       else "all listed report bytes")}
+
+
+_COMPACT_META_LIMIT = 1 << 16
+_COMPACT_BUCKET_LIMIT = 16 << 20
+_COMPACT_JSON_LIMIT = 64 << 20
+
+
+def compact_object(raw, limit, what):
+    if len(raw) > limit:
+        raise NIError("hash_mismatch", f"oversized compact index {what}")
+    try:
+        obj = json.loads(raw)
+    except (ValueError, RecursionError) as ex:
+        raise NIError("hash_mismatch", f"invalid compact index {what}") from ex
+    if not isinstance(obj, dict):
+        raise NIError("hash_mismatch", f"malformed compact index {what}")
+    return obj
+
+
+def verify_compact_root(raw, sigraw, pem, root_pin, receipt_pin, key_id, train, build, variant, want):
+    """Validate a projection against an independently admitted receipt and its trusted public key."""
+    if sha256(raw) != root_pin:
+        raise NIError("hash_mismatch", "compact index root differs from its pin")
+    root = compact_object(raw, _COMPACT_META_LIMIT, "root")
+    sig = compact_object(sigraw, _COMPACT_META_LIMIT, "signature")
+    pid, version_key, labels = "mreg/declaration-compact-index", build + "-" + variant, ["verified-declaration-index"]
+    expected = {"schema": "mreg-sig/1", "alg": "ECDSA_P256_SHA256", "id": pid, "version": train,
+                "build_key": version_key, "labels": labels, "manifest_sha256": root_pin, "key_id": key_id}
+    try:
+        valid = (all(sig.get(k) == v for k, v in expected.items()) and isinstance(sig["promoted_at"], str)
+                 and sha256(pem_to_der(pem))[:16] == key_id
+                 and ec_verify(pem, sig_message(pid, train, version_key, root_pin, labels, sig["promoted_at"]),
+                               base64.b64decode(sig["signature"], validate=True)))
+    except (ValueError, KeyError, TypeError):
+        valid = False
+    if not valid:
+        raise NIError("unverified_refused", "invalid compact index signature for declaration receipt signer")
+    fields = {"schema": "mreg-compact-declaration-index/1", "train": train, "build": build,
+              "variant": variant, "receipt_sha256": receipt_pin, "index_sha256": want}
+    groups = root.get("groups")
+    if (any(root.get(k) != v for k, v in fields.items()) or not isinstance(groups, dict)
+            or set(groups) != {"names", "chunks"}):
+        raise NIError("hash_mismatch", "compact index root differs from signed receipt or group schema")
+    for table in groups.values():
+        if not isinstance(table, dict) or any(not re.fullmatch("[0-9a-f]{2}", k) or not isinstance(v, str)
+                                              or not _HEX64.fullmatch(v) for k, v in table.items()):
+            raise NIError("hash_mismatch", "invalid compact index directory digest")
+    return root
+
+
+class CompactLookup:
+    def __init__(self, f, store, base, groups):
+        import functools
+        self.f, self.base, self.groups = f, base, groups
+        self.cache = _pathlib.Path(store.root) / "compact-proofs"
+        self.directory = functools.lru_cache(maxsize=512)(self._directory)
+        self.bucket = functools.lru_cache(maxsize=16)(self._bucket)
+
+    def _verified_bytes(self, digest, limit, fetch):
+        path = self.cache / digest[:2] / digest
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(limit + 1)
+        except FileNotFoundError:
+            data = fetch()
+            cached = False
+        else:
+            cached = True
+        if len(data) > limit or sha256(data) != digest:
+            raise NIError("hash_mismatch", "compact proof bytes differ from their authenticated digest")
+        if not cached:
+            atomic_write(str(path), data)
+        return data
+
+    def _directory(self, kind, aa):
+        digest = self.groups[kind][aa]
+        path = self.base + "/" + kind + "/" + aa + ".json"
+        data = self._verified_bytes(digest, _COMPACT_META_LIMIT, lambda: self.f.get(path, _COMPACT_META_LIMIT))
+        directory = compact_object(data, _COMPACT_META_LIMIT, "directory")
+        total = 0
+        for key, segment in sorted(directory.items()):
+            if not (re.fullmatch("[0-9a-f]{2}", key) and isinstance(segment, list) and len(segment) == 3
+                    and type(segment[0]) is int and segment[0] == total and type(segment[1]) is int
+                    and 0 < segment[1] <= _COMPACT_BUCKET_LIMIT and isinstance(segment[2], str)
+                    and _HEX64.fullmatch(segment[2])):
+                raise NIError("hash_mismatch", "malformed compact proof range directory")
+            total += segment[1]
+        return directory, total
+
+    def _bucket(self, kind, aa, bb):
+        directory, total = self.directory(kind, aa)
+        if bb not in directory:
+            return {}
+        start, size, digest = directory[bb]
+        def fetch():
+            path = self.base + "/" + kind + "/" + aa + ".bin"
+            try:
+                with self.f.open_range(path, start, start + size, total) as body:
+                    raw = body.read(size)
+                    if len(raw) != size or body.read(1):
+                        raise NIError("hash_mismatch", "incorrect compact proof range length")
+                    if self.f.kind != "file":
+                        self.f._count_bytes(size)
+                    return raw
+            except (RangeError, OSError, http.client.HTTPException) as ex:
+                raise NIError("index_unavailable", f"compact proof range unavailable: {ex}") from ex
+        data = self._verified_bytes(digest, size, fetch)
+        try:
+            with _gzip.GzipFile(fileobj=io.BytesIO(data)) as source:
+                raw = source.read(_COMPACT_JSON_LIMIT + 1)
+        except (OSError, EOFError, zlib.error) as ex:
+            raise NIError("hash_mismatch", "invalid compressed compact index bucket") from ex
+        return compact_object(raw, _COMPACT_JSON_LIMIT, "bucket")
+
+    def _value(self, kind, route, key):
+        aa = route[:2]
+        if aa in self.groups[kind]:
+            bucket = self.bucket(kind, aa, route[2:4])
+            if key in bucket:
+                if bucket[key] is None:
+                    raise NIError("hash_mismatch", "invalid null compact proof record")
+                return bucket[key]
+        return None
+
+    def find(self, name):
+        rows = self._value("names", sha256(name.encode("utf-8")), name)
+        if rows is None:
+            return []
+        if not isinstance(rows, list) or not rows:
+            raise NIError("hash_mismatch", "malformed compact declaration rows")
+        found = []
+        for row in rows:
+            if not (isinstance(row, list) and len(row) == 6 and all(isinstance(x, str) for x in row[:4])
+                    and name in row[:2] and type(row[4]) is int and row[4] in (0, 1) and isinstance(row[5], str)
+                    and (row[5] == "" if row[4] else _HEX32.fullmatch(row[5]))):
+                raise NIError("hash_mismatch", "malformed compact declaration")
+            found.append(dict(name=row[0], exact_name=row[1], module=row[2], kind=row[3], in_toolchain=bool(row[4]),
+                              chunk=row[5] or None, chunk_index=row[5] or None))
+        return found
+
+    def suggest(self, name):
+        return []
+
+    def cone(self, roots):
+        self.selected = {}
+        stack = list(roots)
+        while stack:
+            cid = stack.pop()
+            if cid in self.selected:
+                continue
+            row = self._value("chunks", cid, cid)
+            if not (isinstance(row, list) and len(row) == 6
+                    and all(isinstance(row[i], str) and _HEX64.fullmatch(row[i]) for i in (0, 2))
+                    and all(type(row[i]) is int and row[i] > 0 for i in (1, 3, 4))
+                    and isinstance(row[5], list) and all(isinstance(x, str) and _HEX32.fullmatch(x) for x in row[5])
+                    and row[5] == sorted(set(row[5]))):
+                raise NIError("hash_mismatch", f"missing or malformed compact closure record {cid}")
+            self.selected[cid] = dict(id=cid, sha256_raw=row[0], bytes_raw=row[1],
+                                      sha256_stored=row[2], bytes_stored=row[3], n_decls=row[4])
+            stack.extend(row[5])
+        return sorted(self.selected)
+
+    def chunk_hex(self, cid):
+        return cid
+
+    def manifest(self, variant, cid):
+        return self.selected[cid]
+
+
+@contextlib.contextmanager
+def selection_lookup(f, store, train, build, variant, want, admission, receipt, compact):
+    if compact:
+        base = ni_path(train, build, variant, "compact")
+        key_id = admission["key_id"]
+        pem, problem = key_pem(Registry(), key_id)
+        if problem:
+            raise NIError("unverified_refused", problem)
+        root = verify_compact_root(f.get(base + "/root.json", _COMPACT_META_LIMIT),
+                                   f.get(base + "/root.json.sig", _COMPACT_META_LIMIT), pem, compact,
+                                   receipt, key_id, train, build, variant, want)
+        lookup = CompactLookup(f, store, base, root["groups"])
+        try:
+            yield lookup
+        finally:
+            lookup.directory.cache_clear()
+            lookup.bucket.cache_clear()
+    else:
+        idir, _, _ = ensure_index(f, store, train, build, want)
+        with chunk_lookup(idir, want, bool(receipt)) as lookup:
+            yield lookup
+
+
+@contextlib.contextmanager
+def chunk_lookup(idir, want, verified):
+    # The sqlite and CSR caches are derived files. Rebuild them from authenticated
+    # compressed indexes for a verification decision, including on lock restore.
+    with contextlib.ExitStack() as stack:
+        if verified:
+            tmp = stack.enter_context(_tempfile.TemporaryDirectory())
+            for filename in INDEX_FILES:
+                data = read_file_retry(os.path.join(idir, filename))
+                if sha256(data) != want[filename]:
+                    raise NIError("hash_mismatch", f"cached {filename} differs from signed receipt")
+                with open(os.path.join(tmp, filename), "wb") as out:
+                    out.write(data)
+            build_lookup(tmp)
+            build_manifest_db(tmp)
+            idir = tmp
+        lookup = Lookup(idir)
+        stack.callback(lookup.close)
+        yield lookup
 
 
 _CHUNK_APACHE_2_0_TEXT = """Apache License
@@ -4581,8 +5934,6 @@ def ni_run(cmd, a, entries, record=False):
     Order (each step before any chunk is fetched): pointer -> train document -> toolchain gate -> hash-matched index -> resolution
     (an unknown name is answered only from the hash-matched index and names it) -> cone -> request budget -> fetch."""
     t0 = time.time()
-    if cmd != "resolve" and not getattr(a, "dry_run", False) and not allow_unverified(a):
-        raise chunk_refusal(f"`mreg {cmd}` by declaration")      # before any request: the chunk store has no promotion gate
     d = os.path.abspath(a.dir)
     cfg, cc, lock = ni_load_cfg(d)
     variant = getattr(a, "variant", None) or (lock or {}).get("variant") or cc.get("variant") or "checking"
@@ -4604,16 +5955,39 @@ def ni_run(cmd, a, entries, record=False):
         raise NIError("forbidden_mix", f"checking and full chunks in one project: the project holds {lock['variant']}, this asks for {variant}")
     notes = []
     try:
-        ptr = read_pointer(f, train)
+        td = f.json(f"/v1/index/trains/{train}.json")
+    except NIError as e:
+        if _not_found(e):
+            raise NIError("not_on_train", f"no train document for {train}")
+        raise
+    if not td.get("toolchain"):
+        raise NIError("error", f"the train document of {train} names no toolchain; refusing to install chunks")
+    asked_build = getattr(a, "build", None)
+    supplied_digest = getattr(a, "source_manifest_sha256", None)
+    routes = (lock or {}).get("source_routes", [])
+    using_default = False
+    try:
+        if lock and not upgrade:
+            ptr = read_pointer(f, train)
+        else:
+            requested = [*cc.get("declarations", []), *entries]
+            ptr, routes, using_default = discover_store(f, train, td, requested, asked_build, supplied_digest)
     except NIError as e:
         if lock and not upgrade and e.kind in ("not_on_train", "network"):
             ptr = None
             notes.append(f"pointer unavailable ({e.message}); staying on locked build {lock['build']}")
         else:
             raise
-    asked_build = getattr(a, "build", None)
     if lock and not upgrade:
         build, want = lock["build"], want_from_lock(lock)
+        if routes:
+            old_packages = {r["id"] for r in routes}
+            added = [e for e in entries if (p := parse_decl(e)) and p[0] not in old_packages]
+            if added:
+                added_ptr, added_routes, _ = discover_store(f, train, td, added, build, supplied_digest)
+                if receipt_pin(added_ptr, lock, build, variant) != lock.get("receipt_sha256"):
+                    raise NIError("hash_mismatch", "additional package selects another signed declaration receipt")
+                routes = routes + added_routes
         if asked_build and asked_build != build:
             raise NIError("forbidden_mix", f"chunks from two builds: the project holds build {build}, --build asks for {asked_build}")
         if ptr and ptr["build"] != build:
@@ -4629,17 +6003,30 @@ def ni_run(cmd, a, entries, record=False):
                           "only the current build (or the locked one) can be chosen")
         if variant not in ptr["variants"]:
             raise NIError("not_on_train", f"train {train} build {build} serves {ptr['variants']}, not {variant}")
-    chunk_dir = os.path.abspath(os.path.join(d, *(getattr(a, "chunk_dir", None) or cc.get("dir") or
-                                                  f".lake/mreg-chunks/{train}").split("/")))
-    try:
-        td = f.json(f"/v1/index/trains/{train}.json")
-    except NIError as e:
-        if _not_found(e):
-            raise NIError("not_on_train", f"no train document for {train}")
-        raise
-    if not td.get("toolchain"):
-        raise NIError("error", f"the train document of {train} names no toolchain; refusing to install chunks")
+    pin = receipt_pin(ptr, lock, build, variant)
+    if supplied_digest and not pin:
+        raise NIError("unverified_refused", "exact source selection requires a signed declaration receipt")
+    compact = compact_pin(ptr, lock, build, variant)
     dry = cmd == "resolve" or bool(getattr(a, "dry_run", False))
+    if not pin and not dry and not allow_unverified(a):
+        raise chunk_refusal(f"`mreg {cmd}` by declaration")
+    chunk_dir = os.path.abspath(os.path.join(d, *(getattr(a, "chunk_dir", None) or (lock or {}).get("chunk_dir") or cc.get("dir") or
+                                                  f".lake/mreg-chunks/{train}").split("/")))
+    admission = chunk_admission()
+    if pin:
+        if lock and lock.get("receipt_sha256") and lock.get("registry") != f.base:
+            raise NIError("forbidden_mix", "the declaration lock belongs to a different registry")
+        td, admission = admit_chunk_receipt(f, a, train, build, variant, td["toolchain"], want, pin,
+                                           receipt_report_pins=bool(compact))
+        verify_routed_sources(routes, admission, allow_unserved=using_default)
+        if supplied_digest and lock and not upgrade:
+            requested = {p[0] for entry in (entries or cc.get("declarations", [])) if (p := parse_decl(entry))}
+            if len(requested) != 1 or not any(s["id"] in requested and s["manifest_sha256"] == supplied_digest
+                                             for s in admission["sources"]):
+                raise NIError("hash_mismatch", "requested source manifest differs from the locked declaration store")
+        if compact:
+            notes.append("Checked source gate reports and signed supporting report digests. "
+                         "Run mreg audit --strict to recheck every report body.")
     tcs = toolchain_state(d, td["toolchain"])
     if not tcs["match"]:
         if not dry:
@@ -4649,17 +6036,16 @@ def ni_run(cmd, a, entries, record=False):
     covers = sorted(p["lake_name"] for p in (td.get("packages") or {}).values() if p.get("lake_name"))
     check_mix(d, covers, train, build, variant, lock, chunk_dir, upgrade)
     req_before = f.requests
-    idir, imeta, fresh = ensure_index(f, store, train, build, want)
-    idx_requests = f.requests - req_before
     answered = {"train": train, "build": build, "manifest_sha256": want["manifest.tsv.gz"], "index_sha256": dict(want)}
     known = [x["entry"] for x in (lock or {}).get("declarations", [])]
     known += [e for e in (cc.get("declarations") or []) if e not in known]
     allent = list(dict.fromkeys(known + list(entries)))
-    lk = Lookup(idir)
-    try:
+    with selection_lookup(f, store, train, build, variant, want, admission, pin, compact) as lk:
         try:
             recs = [resolve_entry(lk, td, e) for e in allent]
         except NIError as e:
+            if pin and (not routes or using_default) and not asked_build and e.kind in ("unknown_declaration", "not_on_train"):
+                e.extra["verified_selection_unavailable"] = True
             if e.kind in ("unknown_declaration", "ambiguous_name"):
                 e.extra["answered_from"] = answered
                 if e.kind == "unknown_declaration":
@@ -4675,13 +6061,27 @@ def ni_run(cmd, a, entries, record=False):
                 chunks.append(m)
             else:
                 missing.append(lk.chunk_hex(i))
-    finally:
-        lk.close()
+    idx_requests = f.requests - req_before
     if missing:
         raise NIError("missing_object", f"{len(missing)} chunks of the cone are not in the {variant} manifest of build {build}, "
                       f"for example {missing[0]}", chunks=missing[:5])
     totals = {"chunks": len(chunks), "bytes_raw": sum(c["bytes_raw"] for c in chunks),
               "bytes_stored": sum(c["bytes_stored"] for c in chunks)}
+    locked_entry = (lock or {}).get("entry", cc.get("entry", "MregChunks.lean"))
+    ef = None if getattr(a, "no_entry", False) else (getattr(a, "entry", None) or locked_entry)
+    rel_dir = os.path.relpath(chunk_dir, d).replace(os.sep, "/")
+    if pin:
+        prior = (lock or {}).get("chunks", []) if upgrade else []
+        inspect_verified_tree(d, chunk_dir, [*chunks, *prior])
+    if ef:
+        entry_path = verified_entry(d, chunk_dir, ef) if pin else _pathlib.Path(d, ef)
+        desired = generated_entry_bytes(recs, pin, train, build, variant, rel_dir)
+        previous = None
+        if lock and locked_entry and _pathlib.Path(d, locked_entry).absolute() == entry_path.absolute():
+            previous = generated_entry_bytes(lock["declarations"], lock.get("receipt_sha256"), lock["train"],
+                                             lock["build"], lock["variant"], lock["chunk_dir"])
+        if cmd != "resolve":
+            update_generated_entry(entry_path, desired, previous, write=False)
     todo_entries, _r = missing_from_store(store, chunks)
     would = len(todo_entries)
     pinfo = packed_info(ptr, variant) if (ptr and ptr["build"] == build) else None
@@ -4704,6 +6104,8 @@ def ni_run(cmd, a, entries, record=False):
                "packed": prep, "notes": notes}
     head = [f"{r['entry']}: {r['kind']} in {r['module']}, " +
             ("provided by the toolchain; nothing to fetch" if r["in_toolchain"] else f"chunk {r['chunk']}") for r in recs]
+    if pin:
+        payload["admission"] = admission
     if dry:
         if pk:
             pk.close()
@@ -4736,43 +6138,40 @@ def ni_run(cmd, a, entries, record=False):
             raise NIError("error", f"{chunk_dir} has no {MARKER}; refusing to clear a directory mreg did not make")
         shutil.rmtree(os.path.join(chunk_dir, "Mreg"))
     wr, pre = install_chunks(store, chunk_dir, chunks)
-    _ensure_chunk_licenses(f, store, train, chunk_dir)
+    if pin:
+        atomic_write(os.path.join(chunk_dir, "THIRD_PARTY_LICENSES.txt"), td["notices"])
+    else:
+        _ensure_chunk_licenses(f, store, train, chunk_dir)
     atomic_write(os.path.join(chunk_dir, MARKER), (json.dumps({"schema": "mreg-chunk-dir/1", "train": train, "build": build,
                                                                 "variant": variant}) + "\n").encode())
-    rel_dir = os.path.relpath(chunk_dir, d).replace(os.sep, "/")
     published = (ptr or {}).get("published_at") if (ptr and ptr["build"] == build) else (lock or {}).get("published_at")
     lockd = {"schema": CHUNK_LOCK_SCHEMA, "registry": f.base, "train": train, "build": build, "variant": variant,
              "toolchain": td["toolchain"], "manifest_sha256": want["manifest.tsv.gz"], "published_at": published,
-             "index": {k: v["sha256"] for k, v in imeta["index"].items()}, "chunk_dir": rel_dir, "covers_packages": covers,
+             "index": dict(want), "chunk_dir": rel_dir, "covers_packages": covers,
              "declarations": [{k: r[k] for k in ("entry", "package", "name", "exact_name", "module", "kind", "chunk")} for r in recs],
-             "admission": dict(chunk_admission(), downloaded=True, hash_matched=True, compatible="not checked"),
+             "admission": dict(admission, downloaded=True, hash_matched=True, compatible="not checked"),
              "counts": {"declarations": len(recs), "chunks": len(chunks)},
              "bytes": {"raw": totals["bytes_raw"], "stored": totals["bytes_stored"]},
              "chunks": [{k: c[k] for k in ("id", "sha256_raw", "bytes_raw", "sha256_stored", "bytes_stored")} for c in chunks]}
+    lockd["entry"] = ef
+    if pin:
+        lockd["receipt_sha256"] = pin
+    if compact:
+        lockd["compact_index_sha256"] = compact
+    if routes:
+        lockd["source_routes"] = routes
     if pinfo:
         lockd["packed"] = {"path": pinfo["path"], "packed_sha256": pinfo["packed_sha256"]}
     lock_path = os.path.join(d, CHUNK_LOCK)
-    atomic_write(lock_path, (json.dumps(lockd, indent=1) + "\n").encode())
-    ef = None if getattr(a, "no_entry", False) else (getattr(a, "entry", None) or cc.get("entry") or "MregChunks.lean")
     if ef:
-        lines = [f"-- generated by mreg ({CHUNK_LOCK}): train {train}, build {build}, {variant} chunks. Do not edit.",
-                 f"-- LEAN_PATH must contain {rel_dir} (`mreg env`).",
-                 "-- " + SUPPORTS]
-        seen = set()
-        for r in recs:
-            if r["in_toolchain"]:
-                lines.append(f"-- {r['entry']}: provided by the toolchain ({r['module']}), nothing to import")
-            elif r["chunk"] not in seen:
-                seen.add(r["chunk"])
-                lines.append(f"import {chunk_module(r['chunk'])}  -- {r['entry']}")
-        atomic_write(os.path.join(d, ef), ("\n".join(lines) + "\n").encode())
+        update_generated_entry(entry_path, desired, previous, write=True)
+    atomic_write(lock_path, (json.dumps(lockd, indent=1) + "\n").encode())
     if record:
         cfg = dict(cfg)
         cfg.setdefault("registry", f.base)
         cfg.setdefault("train", train)
         cc.update({"train": train, "build": build, "variant": variant, "dir": rel_dir, "declarations": allent})
-        if ef:
-            cc["entry"] = ef
+        cc["entry"] = ef
         cfg["chunks"] = cc
         atomic_write(os.path.join(d, "mreg.json"), (json.dumps(cfg, indent=1) + "\n").encode())
     payload.update({"fetched": nf, "reused": nr, "installed": wr, "already_installed": pre, "bytes_fetched": bytes_fetched,
@@ -4780,8 +6179,9 @@ def ni_run(cmd, a, entries, record=False):
                     "seconds_fetch": seconds_fetch, "seconds": round(time.time() - t0, 3), "lock": lock_path, "chunk_dir": chunk_dir,
                     "entry_file": os.path.join(d, ef) if ef else None, "lean_path": chunk_dir})
     payload["admission"] = lockd["admission"]
-    notice(a, f"UNVERIFIED: declaration chunks of train {train} build {build} are installed without passing the registry's proof policy: "
-              f"{CHUNK_UNVERIFIED}", err=False)
+    if not pin:
+        notice(a, f"UNVERIFIED: declaration chunks of train {train} build {build} are installed without passing the registry's proof policy: "
+                  f"{CHUNK_UNVERIFIED}", err=False)
     ni_out(a, payload, head + [
         f"cone {len(chunks)} chunks ({human_bytes(totals['bytes_stored'])} stored); fetched {nf}, reused {nr} from the local store; "
         f"{wr} written, {pre} already installed; {f.requests} requests, {human_bytes(bytes_fetched)}, {payload['seconds']} s",
@@ -4792,13 +6192,62 @@ def ni_run(cmd, a, entries, record=False):
     return 0
 
 
+def validate_chunk_lock(f, store, a, lock, pin, full_reports=False):
+    train, build, variant = lock["train"], lock["build"], lock["variant"]
+    if not (_NAME_OK.fullmatch(train) and _NAME_OK.fullmatch(build) and variant == "checking"):
+        raise NIError("error", "invalid verified declaration lock selection")
+    ents = lock["chunks"]
+    if f.base != lock.get("registry"):
+        raise NIError("forbidden_mix", "the declaration lock belongs to a different registry")
+    want = want_from_lock(lock)
+    compact = compact_pin(None, lock, build, variant)
+    source_train, admission = admit_chunk_receipt(f, a, train, build, variant, lock.get("toolchain"), want, pin,
+                                                 receipt_report_pins=bool(compact) and not full_reports)
+    verify_routed_sources(lock.get("source_routes", []), admission)
+    covers = sorted(p["lake_name"] for p in source_train["packages"].values())
+    if covers != lock.get("covers_packages"):
+        raise NIError("hash_mismatch", "locked package ownership differs from the signed receipt")
+    with selection_lookup(f, store, train, build, variant, want, admission, pin, compact) as lk:
+        requested = [resolve_entry(lk, source_train, r["entry"]) for r in lock["declarations"]]
+        declarations = [{k: r[k] for k in ("entry", "package", "name", "exact_name", "module", "kind", "chunk")}
+                        for r in requested]
+        if declarations != lock["declarations"]:
+            raise NIError("hash_mismatch", "locked declarations differ from the signed assignment")
+        cone = lk.cone([r["chunk_index"] for r in requested if not r["in_toolchain"]])
+        selected = []
+        for i in cone:
+            m = lk.manifest(variant, lk.chunk_hex(i))
+            if m is None:
+                raise NIError("hash_mismatch", "a required chunk is missing from the signed manifest")
+            selected.append({k: m[k] for k in ("id", "sha256_raw", "bytes_raw", "sha256_stored", "bytes_stored")})
+        if ents != selected:
+            raise NIError("hash_mismatch", "locked chunks differ from the complete signed dependency closure")
+    if lock.get("admission", {}).get("sources") != admission["sources"]:
+        raise NIError("hash_mismatch", "locked source pins differ from the signed receipt")
+    old = lock.get("admission", {})
+    embedded_dependency = any("embedded_dependencies" in s for s in admission["dependency_sources"])
+    if ("dependency_sources" in old or embedded_dependency) and old.get("dependency_sources") != admission["dependency_sources"]:
+        raise NIError("hash_mismatch", "locked dependency source pins differ from the signed receipt")
+    project = os.path.abspath(a.dir)
+    chunk_dir = verified_project_path(project, os.path.join(project, lock["chunk_dir"]))
+    inspect_verified_tree(project, chunk_dir, ents)
+    if "entry" not in lock:
+        raise NIError("hash_mismatch", "the verified lock has no generated entry selection")
+    if lock["entry"] is not None:
+        entry = verified_entry(project, chunk_dir, lock["entry"])
+        if entry.exists() and entry.read_bytes() != verified_entry_bytes(declarations):
+            raise NIError("hash_mismatch", f"{entry}: imports differ from the signed declaration selection")
+    return admission, source_train["notices"]
+
+
 def ni_ci(a):
     t0 = time.time()
     d = os.path.abspath(a.dir)
     lock = _read_json(os.path.join(d, CHUNK_LOCK))
     if lock is None or lock.get("schema") != CHUNK_LOCK_SCHEMA:
         raise NIError("error", f"no valid {CHUNK_LOCK} here")
-    if not allow_unverified(a):
+    pin = receipt_pin(None, lock, lock["build"], lock["variant"])
+    if not pin and not allow_unverified(a):
         raise chunk_refusal("`mreg ci` of the chunk lock")
     ents = [dict(c) for c in lock["chunks"]]
     for c in ents:
@@ -4814,6 +6263,7 @@ def ni_ci(a):
         raise NIError("forbidden_mix", "the original module files of " + ", ".join(hit) +
                       " and the locked chunks of the same packages would both be on the search path")
     f, store = Fetcher(), Store()      # the pointer is NOT read: ci restores the locked build even if the pointer moved on
+    admission, notices = validate_chunk_lock(f, store, a, lock, pin) if pin else (chunk_admission(), None)
     chunk_dir = os.path.abspath(os.path.join(d, *lock["chunk_dir"].split("/")))
     mk = _read_json(os.path.join(chunk_dir, MARKER))
     if mk and (mk.get("train"), mk.get("build"), mk.get("variant")) != (train, build, variant):
@@ -4850,7 +6300,13 @@ def ni_ci(a):
             removed += 1
     atomic_write(os.path.join(chunk_dir, MARKER), (json.dumps({"schema": "mreg-chunk-dir/1", "train": train, "build": build,
                                                                 "variant": variant}) + "\n").encode())
-    _ensure_chunk_licenses(f, store, train, chunk_dir)
+    if pin:
+        atomic_write(os.path.join(chunk_dir, "THIRD_PARTY_LICENSES.txt"), notices)
+    else:
+        _ensure_chunk_licenses(f, store, train, chunk_dir)
+    if pin and lock["entry"]:
+        entry = verified_entry(d, chunk_dir, lock["entry"])
+        update_generated_entry(entry, verified_entry_bytes(lock["declarations"]), None, write=True)
     payload = {"schema": NI_SCHEMA, "ok": True, "command": "ci", "registry": f.base, "train": train, "build": build,
                "variant": variant, "manifest_sha256": lock["manifest_sha256"], "index_sha256": want_from_lock(lock),
                "requested": [dict(r, in_toolchain=r["chunk"] is None, provided_by="toolchain" if r["chunk"] is None else "chunk")
@@ -4860,12 +6316,28 @@ def ni_ci(a):
                "removed_extra": removed, "bytes_fetched": f.bytes, "requests": f.requests, "requests_index": 0,
                "requests_objects": f.requests, "seconds": round(time.time() - t0, 3), "lock": os.path.join(d, CHUNK_LOCK),
                "chunk_dir": chunk_dir, "lean_path": chunk_dir}
-    payload["admission"] = chunk_admission()
-    notice(a, f"UNVERIFIED: declaration chunks of train {train} build {build} are restored without passing the registry's proof policy: "
-              f"{CHUNK_UNVERIFIED}", err=False)
+    payload["admission"] = admission
+    if not pin:
+        notice(a, f"UNVERIFIED: declaration chunks of train {train} build {build} are restored without passing the registry's proof policy: "
+                  f"{CHUNK_UNVERIFIED}", err=False)
     ni_out(a, payload, [f"ci: restored {len(ents)} locked chunks of train {train} build {build} {variant}: fetched {nf}, reused {nr}, "
                         f"{wr} written, {pre} already installed, {removed} extra removed; {f.requests} requests; every hash matched"])
     return 0
+
+
+def installed_chunk_admission(a, lock, full_reports=False):
+    d = os.path.abspath(a.dir)
+    pin = receipt_pin(None, lock, lock["build"], lock["variant"])
+    if not pin and (lock.get("admission") or {}).get("proof_checked_under_policy"):
+        raise NIError("unverified_refused", "the lock claims verification without a pinned declaration receipt")
+    admission, notices = validate_chunk_lock(Fetcher(), Store(), a, lock, pin, full_reports=full_reports) if pin else (None, None)
+    if pin and lock["entry"] and not os.path.isfile(os.path.join(d, lock["entry"])):
+        raise NIError("hash_mismatch", "the generated declaration entry is missing")
+    chunk_dir = os.path.abspath(os.path.join(d, *lock["chunk_dir"].split("/")))
+    notice_file = _pathlib.Path(chunk_dir, "THIRD_PARTY_LICENSES.txt")
+    if pin and (not notice_file.is_file() or notice_file.read_bytes() != notices):
+        raise NIError("hash_mismatch", "installed notices differ from the signed source documents")
+    return admission
 
 
 def ni_verify(a):
@@ -4873,6 +6345,8 @@ def ni_verify(a):
     lock = _read_json(os.path.join(d, CHUNK_LOCK))
     if lock is None or lock.get("schema") != CHUNK_LOCK_SCHEMA:
         raise NIError("error", f"no valid {CHUNK_LOCK} here")
+    admission = installed_chunk_admission(a, lock)
+    pin = bool(admission)
     chunk_dir = os.path.abspath(os.path.join(d, *lock["chunk_dir"].split("/")))
     bad, missing = [], []
     def check(c):
@@ -4889,14 +6363,21 @@ def ni_verify(a):
             elif st == "bad":
                 bad.append(cid)
     extra = sorted(set(installed_chunk_files(chunk_dir)) - {c["id"] for c in lock["chunks"]})
-    ok = not (bad or missing)
+    ok = not (bad or missing or (pin and extra))
+    verify_note = ("Revalidated the signature, source builds and complete signed dependency closure."
+                   if pin else
+                   "this is a hash check, not a check of proofs; declaration chunks are experimental and unverified")
+    if pin and lock.get("compact_index_sha256"):
+        verify_note += " Checked source gate reports and signed supporting report digests."
     payload = {"schema": NI_SCHEMA, "ok": ok, "command": "verify", "train": lock["train"], "build": lock["build"],
                "variant": lock["variant"], "checked": len(lock["chunks"]), "mismatched": bad, "missing": missing,
                "extra": extra, "chunk_dir": chunk_dir,
-               "note": "a hash check, not a check of proofs; declaration chunks are experimental and unverified"}
+               "note": verify_note}
+    if admission:
+        payload["admission"] = admission
     ni_out(a, payload, [f"hashes matched: {len(lock['chunks']) - len(bad) - len(missing)} of {len(lock['chunks'])} chunks of build {lock['build']} equal the lock's SHA-256 (not a check of proofs): {len(bad)} mismatched, {len(missing)} missing, "
                         f"{len(extra)} extra",
-                        "this is a hash check, not a check of proofs; declaration chunks are experimental and unverified"] + [f"MISMATCH {c}" for c in bad] + [f"MISSING {c}" for c in missing])
+                        verify_note] + [f"MISMATCH {c}" for c in bad] + [f"MISSING {c}" for c in missing])
     if not ok:
         raise _Quiet("hash_mismatch", "installed chunks differ from the lock")
     return 0
@@ -4910,7 +6391,8 @@ def ni_env(a):
     if not rel:
         raise NIError("error", "no chunk directory recorded here (run `mreg add owner/pkg#Decl` first)")
     cd = os.path.abspath(os.path.join(d, *rel.split("/")))
-    entry = os.path.join(d, cc["entry"]) if cc.get("entry") else None
+    rel_entry = (lock or {}).get("entry", cc.get("entry"))
+    entry = os.path.join(d, rel_entry) if rel_entry else None
     payload = {"schema": NI_SCHEMA, "ok": True, "command": "env", "chunk_dir": cd, "lean_path": cd, "path_separator": os.pathsep,
                "entry_file": entry}
     ni_out(a, payload, [f"LEAN_PATH={cd}{os.pathsep}$LEAN_PATH   (chunk modules are Mreg.X<2 hex>.C<id>)"] +
@@ -4958,9 +6440,19 @@ def ni_probe(a):
         read_pointer(f, train)
         return True
     except NIError as e:
-        if e.kind == "not_on_train":
+        if e.kind != "not_on_train":
+            raise
+    # A train can publish package-specific stores before it has a default store.
+    entries = getattr(a, "ids", None) or getattr(a, "modules", None) or cc.get("declarations", [])
+    asked = getattr(a, "build", None)
+    try:
+        td = f.json(f"/v1/index/trains/{train}.json")
+        discover_store(f, train, td, entries, asked, getattr(a, "source_manifest_sha256", None))
+    except NIError as e:
+        if not asked and not getattr(a, "source_manifest_sha256", None) and (e.kind == "not_on_train" or _not_found(e)):
             return False
         raise
+    return True
 
 
 def ni_index(a):
@@ -5029,11 +6521,13 @@ def ni_flags(p, install=False, ci=False):
         p.add_argument("--chunks-only", action="store_true", help="restore mreg-chunks.lock.json only")
         return
     p.add_argument("--variant", choices=VARIANTS, help="checking (default) or full; one per project")
-    p.add_argument("--build", help="a build of the train's store (the current one, or the locked one)")
+    p.add_argument("--build", help="the exact declaration store build on this train")
+    p.add_argument("--source-manifest-sha256", help="pin one declaration package to an exact signed source manifest")
     p.add_argument("--chunk-dir", help="chunk directory relative to the project (default .lake/mreg-chunks/<train>)")
     p.add_argument("--entry", help="generated entry file (default MregChunks.lean)"); p.add_argument("--no-entry", action="store_true")
     p.add_argument("--chunks", action="store_true", help="require the declaration-level store (no module-level fallback)")
-    p.add_argument("--module-level", action="store_true", help="use the module-level path even if a chunk store exists")
+    p.add_argument("--module-level", "--preserve-behavior", action="store_true",
+                   help="install original modules including instances, tactics, initializers and runtime code")
     if install:
         p.add_argument("--upgrade-build", action="store_true", help="move the project to the registry's current build")
 
@@ -5684,6 +7178,7 @@ class CheckCtx:
         self.t0 = time.time()
         self._reg = None
         self.has_state = os.path.exists(os.path.join(self.dir, STATE))
+        self.chunk_admission = None
         self.chunk_lock = _read_json(os.path.join(self.dir, CHUNK_LOCK))
         self.lock = _read_json(os.path.join(self.dir, "mreg.lock"))
         self.modules = lc_own_modules(self.dir)
@@ -5773,6 +7268,9 @@ def step_integrity(ctx):
                          "signature": r["signature"], "problems": r["problems"]} for r in rows]
     if ctx.chunk_lock:
         cl = ctx.chunk_lock
+        if cl.get("schema") != CHUNK_LOCK_SCHEMA:
+            raise NIError("error", f"unknown declaration lock schema in {CHUNK_LOCK}")
+        ctx.chunk_admission = installed_chunk_admission(ctx.a, cl, full_reports=True)
         chunk_dir = os.path.abspath(os.path.join(ctx.dir, *cl["chunk_dir"].split("/")))
         bad, missing = [], []
         for c in cl.get("chunks", []):
@@ -5783,6 +7281,8 @@ def step_integrity(ctx):
                 bad.append(c["id"])
         det["chunks"] = {"checked": len(cl.get("chunks", [])), "mismatched": bad, "missing": missing, "train": cl.get("train"),
                          "build": cl.get("build"), "variant": cl.get("variant")}
+        if ctx.chunk_admission:
+            det["chunks"]["admission"] = ctx.chunk_admission
         for c in bad:
             fails.append(f"MISMATCH chunk {c}")
             kind = "hash_mismatch"
@@ -6087,6 +7587,11 @@ def lc_trust_basis(ctx, g):
     labels = (row or {}).get("labels") or []
     label = "/".join(labels) if labels else "none"
     if g["id"] == "chunks":
+        if ctx.chunk_admission:
+            return {"text": "Step 1 validated the signed kernel-declaration receipt, its source builds and the selected dependency closure.",
+                    "label": "verified-declarations", "sample_recompile": None}
+        if ctx.chunk_lock and ctx.chunk_lock.get("receipt_sha256"):
+            return {"text": "Step 1 could not validate the signed declaration receipt.", "label": None, "sample_recompile": None}
         return {"text": "unverified experimental chunks: not replayed here, and no registry gate (axiom audit, kernel replay, second kernel) has checked them; "
                         "step 1 only shows the bytes equal the store's index", "label": None, "sample_recompile": None}
     txt = LC_NOT_REPLAYED.format(label=label)
@@ -6227,7 +7732,7 @@ def cmd_check_run(a):
     reasons = []
     if getattr(a, "fast", False):
         reasons.append("--fast: steps 4 and 7 were not run")
-    if ctx.chunk_lock:
+    if ctx.chunk_lock and not ctx.chunk_lock.get("receipt_sha256"):
         reasons.append("this project has declaration chunks: they are unverified experimental, and no registry gate, replay or axiom audit covers them")
     for s in steps:
         if s["step"] in (5, 7) and s["verdict"] == "pass" and not s["complete"]:

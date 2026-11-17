@@ -1,11 +1,8 @@
 # Named import: `mreg add owner/pkg#Decl.name`
 
-The declaration-level import path of the `mreg` client (`mreg/next/mreg.py`, version 0.4.0). Plan section 2a. The unit a consumer
-names is the declaration; the client fetches only the compiled chunks that declaration's check depends on. No Lean runs in the
-client. Tests: `test_named_import.py` (stdlib, no network, no Lean). Status: built against the FINAL store layout (2026-11-10, build
-numbers, three pinned index files, `in_toolchain` column) and tested against a local mirror in that layout and against the real
-Lean 4.34.1 tables mapped to the final columns inside the test; **not run against a real registry** (build `b1` is not uploaded yet;
-the end-to-end harness in `e2e/` is the test for that).
+With mreg 0.6.0, a named install on a train with a signed checking store verifies the declaration receipt, exact source builds, and the selected dependency closure. Use `mreg add --chunks 'owner/pkg#Decl.name'` to require a checking slice. For tactics, notation, instances, or executable code, choose `mreg add --preserve-behavior 'owner/pkg#Decl.name'` in a module project. `mreg ci` restores the locked selection. `mreg verify` checks its installed files, and `mreg audit --strict` validates its evidence.
+
+The historical b1 store requires explicit experimental opt-in. The layout below documents that original store; verified checking stores additionally pin the signed receipt hash in the pointer and lockfile.
 
 **What a chunk bundle is for (field `supports`, in every JSON document and as the last line of every human output):**
 kernel checking and reference to declarations by name. The variant `full` adds compiled code, reducibility, structure and projection

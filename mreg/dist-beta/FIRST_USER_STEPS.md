@@ -1,11 +1,11 @@
-# First steps for a private-beta user (client 0.5.2)
+# First steps for a private-beta user (client 0.6.0)
 
 Written 2026-11-12 after the pre-launch reset; updated 2026-11-14 for client 0.5.2. Commands are the client's own (`mreg --help` and `<command> --help`).
 What you should see below is what the registry's records say it should be; wording the client prints that we did not check is
 marked "(wording not checked)". Never paste a key into a chat, a ticket, a file or a command line. If a step differs, see the
 last section.
 
-This is client 0.5.2 (see CHANGES-0.5.2.md). Building on 0.5.0's strict
+Client 0.6.0 supports signed declaration receipts and original-module installs with --preserve-behavior. The previous release was 0.5.2 (see CHANGES-0.5.2.md). Building on 0.5.0's strict
 admission (`install` and `ci` refuse exit 4 without `--allow-unverified`) and `mreg check` (which runs your project's own code and is
 not a sandbox) and 0.5.1's `--require-views` / `MREG_REQUIRE_VIEWS=1` (contract 1.2.0), Tarjan SCC cycle fix in `mreg check`,
 `/.well-known/mreg-auth.json` endpoint discovery, and loopback callback port fallback (`8976`, `8977`, `8978`), 0.5.2 adds signed
@@ -67,35 +67,11 @@ What that means and does not mean is in the page "What is and is not guaranteed"
 agree with the build's manifest; it is not a check of any proof, and 1,148 constants marked `unsafe` or `partial` plus 656
 macro-scoped names are not checked by the second kernel.
 
-## 6. Audit of an unsigned package: a failure is expected
+## 6. Audit an imported build
 
     mreg audit AxiomMath/ClusterAlgebras
 
-This one should FAIL. It prints a row ending in `FAIL`, then indented lines that include `- UNSIGNED: manifest.json.sig is missing`
-and `- strict: unsigned: no registry gate record`, then a summary line starting `audit (strict): 0 of 1 builds pass`. Read the exit
-code right after the command, on its own line (PowerShell):
-
-    echo $LASTEXITCODE
-
-It must print 1 (in a Linux shell, `echo $?`). AxiomMath/ClusterAlgebras and AxiomMath/Stacks are served but not signed and not
-gated yet. That is the strict audit working. If either passes, tell us: something is wrong.
-
-Since 0.5.0, `install` refuses these two unsigned packages too (exit 4, "nothing was installed"). Installing one anyway needs
-`--allow-unverified`; the client then prints an `UNVERIFIED:` banner and records the build as allowed-unverified in `mreg.lock`,
-and `mreg audit` still fails it. Do this only if you know why you want an unchecked build.
-
-## 6b. Audit of an imported package: it passes, with a different label
-
-    mreg audit AxiomMath/RiemannJensen
-
-This one should pass, exit code 0, with one row
-
-    AxiomMath/RiemannJensen 0.0.0-20261023050434.gc1e023fa3ae7 f1fb902e4c5fb2f1  [G2:pass G3:pass G4:pass G5:pass G6:pass G7:pass G8:pass G9:pass G10:pass]  labels=imported  OK
-
-followed by a line starting `note: label imported = files compiled elsewhere, gated here (G2 to G10)`. G1 (the registry's own
-compile) did not run for this build, so it is not shown. The label `imported` means another builder compiled the files and the
-registry gated them and recompiled them and found them identical. It is not the label `clean`. The summary line starts
-`audit (strict): 1 of 1 builds pass`.
+The output names the exact version, build key, and gate results. A passing imported build has a registry signature and verification evidence for the compiled files. Use the exit status to check the result for the version currently served.
 
 ## 6c. `mreg check`: is your project valid?
 
